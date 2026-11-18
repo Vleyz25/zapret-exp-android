@@ -102,6 +102,115 @@ public final class Hello {
         return null;
     }
 
+
+    /** Пропустить DNS-имя, включая сжатые имена (указатель 0xC0 заверщает имя). */
+    private static int skipName(byte[] b, int p, int end) {
+        while (p < end) {
+            int l = b[p] & 0xFF;
+            if (l == 0) return p + 1;
+            if ((l & 0xC0) == 0xC0) return p + 2;
+            p += 1 + l;
+        }
+        return -1;
+    }
+
+    /**
+     * Убрать из DNS-ответа записи AAAA. Нужно, когда у оператора нет IPv6-канала:
+     * туннель всё равно объявляет маршрут ::/0, приложение видит «IPv6 есть» и
+     * подключается к AAAA-адресу, которого в реальности нет — отсюда «нет связи»
+     * там, где на ПК всё работает. Без IPv6 вверх отдаём только A-записи.
+     * null — если убирать нечего или ответ не разбирается (тогда не трогаем).
+     */
+    public static byte[] dnsStripAaaa(byte[] b, int off, int len) {
+        try {
+            if (len - off < 12) return null;
+            if ((b[off + 2] & 0x80) == 0) return null;              // не ответ
+            int end = off + len;
+            int p = off + 12;
+            int qd = u16(b, off + 4);
+            for (int i = 0; i < qd; i++) {
+                p = skipName(b, p, end);
+                if (p < 0 || p + 4 > end) return null;
+                p += 4;
+            }
+            int an = u16(b, off + 6);
+            int ansStart = p;
+            java.io.ByteArrayOutputStream kept = new java.io.ByteArrayOutputStream(len);
+            int keptCount = 0;
+            boolean changed = false;
+            for (int i = 0; i < an; i++) {
+                int rrStart = p;
+                p = skipName(b, p, end);
+                if (p < 0 || p + 10 > end) return null;
+                int type = u16(b, p);
+                int rdlen = u16(b, p + 8);
+                p += 10;
+                if (p + rdlen > end) return null;
+                int rrEnd = p + rdlen;
+                if (type == 28) {
+                    changed = true;                                  // AAAA выбрасываем
+                } else {
+                    kept.write(b, rrStart, rrEnd - rrStart);
+                    keptCount++;
+                }
+                p = rrEnd;
+            }
+            if (!changed) return null;
+            byte[] keepBytes = kept.toByteArray();
+            int rest = end - p;                                      // authority + additional
+            byte[] out = new byte[ansStart - off + keepBytes.length + rest];
+            System.arraycopy(b, off, out, 0, ansStart - off);        // заголовок + вопрос
+            System.arraycopy(keepBytes, 0, out, ansStart - off, keepBytes.length);
+            System.arraycopy(b, p, out, ansStart - off + keepBytes.length, rest);
+            out[6] = (byte) (keptCount >> 8);                        // новый ANCOUNT
+            out[7] = (byte) keptCount;
+            return out;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Короткое описание ответов для журнала: «A x2, AAAA x1». */
+    public static String dnsAnswerKinds(byte[] b, int off, int len) {
+        try {
+            if ((b[off + 2] & 0x80) == 0) return null;
+            int end = off + len;
+            int p = off + 12;
+            int qd = u16(b, off + 4);
+            for (int i = 0; i < qd; i++) {
+                p = skipName(b, p, end);
+                if (p < 0 || p + 4 > end) return null;
+                p += 4;
+            }
+            int an = u16(b, off + 6);
+            int a = 0, aaaa = 0, other = 0;
+            for (int i = 0; i < an; i++) {
+                p = skipName(b, p, end);
+                if (p < 0 || p + 10 > end) break;
+                int type = u16(b, p);
+                int rdlen = u16(b, p + 8);
+                p += 10;
+                if (p + rdlen > end) break;
+                if (type == 1) a++;
+                else if (type == 28) aaaa++;
+                else other++;
+                p += rdlen;
+            }
+            StringBuilder sb = new StringBuilder();
+            if (a > 0) sb.append("A x").append(a);
+            if (aaaa > 0) sb.append(sb.length() > 0 ? ", AAAA x" : "AAAA x").append(aaaa);
+            if (other > 0) sb.append(sb.length() > 0 ? ", прочих " : "прочих ").append(other);
+            if ((b[off + 3] & 0x0F) != 0) sb.append(", rcode=").append(b[off + 3] & 0x0F);
+            return sb.length() == 0 ? null : sb.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static int u16(byte[] b, int i) {
+        return ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF);
+    }
+
     /** Имя домена из DNS-запроса (для сопоставления IP <-> домен). */
     public static String dnsQueryName(byte[] b, int off, int len) {
         try {
@@ -153,24 +262,25 @@ public final class Hello {
     public static List<byte[]> dnsAnswerAddresses(byte[] b, int off, int len) {
         List<byte[]> addrs = new ArrayList<>();
         try {
-            // проходим question section
+            int end = off + len;
+            if (len < 12 || (b[off + 2] & 0x80) == 0) return addrs;      // не ответ
             int p = off + 12;
-            while (p < off + len && (b[p] & 0xFF) != 0) p += 1 + (b[p] & 0xFF);
-            p += 5;                                           // нуль + qtype + qclass
-            int an = ((b[off + 8] & 0xFF) << 8) | (b[off + 9] & 0xFF);
-            for (int i = 0; i < an && p + 12 <= off + len; i++) {
-                // NAME (в том числе сжатые имена)
-                while (p < off + len) {
-                    int l = b[p] & 0xFF;
-                    if (l == 0) { p++; break; }
-                    if ((l & 0xC0) == 0xC0) { p += 2; break; }
-                    p += 1 + l;
-                }
-                if (p + 10 > off + len) break;
-                int type = ((b[p] & 0xFF) << 8) | (b[p + 1] & 0xFF);
-                int rdLen = ((b[p + 8] & 0xFF) << 8) | (b[p + 9] & 0xFF);
+            int qd = u16(b, off + 4);
+            for (int i = 0; i < qd; i++) {
+                p = skipName(b, p, end);
+                if (p < 0 || p + 4 > end) return addrs;
+                p += 4;
+            }
+            // ANCOUNT — смещение 6. Раньше здесь читалось смещение 8 (NSCOUNT), из-за
+            // чего карта «домен -> IP» для QUIC-правил не наполнялась никогда.
+            int an = u16(b, off + 6);
+            for (int i = 0; i < an; i++) {
+                p = skipName(b, p, end);
+                if (p < 0 || p + 10 > end) break;
+                int type = u16(b, p);
+                int rdLen = u16(b, p + 8);
                 p += 10;
-                if (p + rdLen > off + len) break;
+                if (p + rdLen > end) break;
                 if (type == 1 && rdLen == 4) addrs.add(sub(b, p, 4));
                 else if (type == 28 && rdLen == 16) addrs.add(sub(b, p, 16));
                 p += rdLen;

@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.VpnService;
@@ -48,6 +49,11 @@ public class ZapretService extends VpnService
     private static final String TUN_DNS_V6 = "fd71:71::1";
     /** MTU туннеля: подбирается под реальный линк (LTE часто 1420, а не 1500). */
     public static volatile int MTU = 1400;
+    /**
+     * Есть ли у оператора IPv6-канал. Без него туннель с маршрутом ::/0 — ловушка:
+     * приложение получает AAAA, видит «IPv6 работает» и уходит туда, куда хода нет.
+     */
+    public static volatile boolean IPV6_UP = true;
     private static final int NOTIF_ID = 1;
     private static final String CHANNEL = "tunel";
 
@@ -186,27 +192,33 @@ public class ZapretService extends VpnService
      * набора к минимальному и пишем в журнал, какой сработал.
      */
     private boolean openTunel() {
-        String[] tried = new String[3];
-        Exception[] errs = new Exception[3];
-        boolean[] variants = {true, false, false};        // ipv6+свой dns | ipv6 | только v4
-        for (int i = 0; i < 3; i++) {
-            tried[i] = i == 0 ? "v4+v6, свой DNS" : (i == 1 ? "v4+v6, системный DNS" : "только v4");
+        MTU = discoverMtu();
+        IPV6_UP = discoverIpv6();
+        // Если IPv6-канала нет, варианты с маршрутом ::/0 даже не пробуем: это не
+        // «запасной путь», а источник сломанных соединений.
+        int[] order = IPV6_UP ? new int[]{0, 1, 2} : new int[]{2};
+        String[] names = {"v4+v6, свой DNS", "v4+v6, системный DNS", "только v4"};
+        String[] tried = new String[order.length];
+        Exception[] errs = new Exception[order.length];
+        for (int k = 0; k < order.length; k++) {
+            int i = order[k];
+            tried[k] = names[i];
             try {
                 if (buildTunnel(i == 0 || i == 1, i == 0)) {
-                    stats.log("туннель: " + tried[i] + " — ок");
+                    stats.log("туннель: " + tried[k] + " — ок");
                     return true;
                 }
-                errs[i] = new Exception("establish вернул null");
-                stats.log("туннель: " + tried[i] + " — establish вернул null");
+                errs[k] = new Exception("establish вернул null");
+                stats.log("туннель: " + tried[k] + " — establish вернул null");
             } catch (Exception e) {
-                errs[i] = e;
-                stats.log("туннель: " + tried[i] + " — " + describe(e));
+                errs[k] = e;
+                stats.log("туннель: " + tried[k] + " — " + describe(e));
                 try { if (tun != null) { tun.close(); tun = null; } } catch (Exception ignored) { }
             }
         }
         StringBuilder why = new StringBuilder("туннель не поднялся ни в одном варианте");
-        for (int i = 0; i < 3; i++) {
-            if (errs[i] != null) why.append('\n').append(tried[i]).append(": ").append(describe(errs[i]));
+        for (int k = 0; k < order.length; k++) {
+            if (errs[k] != null) why.append('\n').append(tried[k]).append(": ").append(describe(errs[k]));
         }
         fail(why.toString());
         return false;
@@ -214,8 +226,7 @@ public class ZapretService extends VpnService
 
     /** ownDns=false — приложения резолвятся системными серверами, запросы всё равно идут через туннель. */
     private boolean buildTunnel(boolean ipv6, boolean ownDns) throws Exception {
-            MTU = discoverMtu();
-            Builder b = new Builder();
+        Builder b = new Builder();
             b.setSession("Запрет (EXP)");
             b.addAddress(TUN_IP_V4, 32);
             b.addRoute("0.0.0.0", 0);
@@ -250,6 +261,35 @@ public class ZapretService extends VpnService
         return true;
     }
 
+    /** Глобальный (не link-local и не ULA) IPv6-адрес на активном линке = канал есть. */
+    private boolean discoverIpv6() {
+        int v6 = 0;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            Network net = cm.getActiveNetwork();
+            if (net != null) {
+                LinkProperties lp = cm.getLinkProperties(net);
+                if (lp != null) {
+                    // getIpv6Addresses() в публичном API нет — берём все адреса линка
+                    for (LinkAddress la : lp.getLinkAddresses()) {
+                        InetAddress a = la.getAddress();
+                        byte[] addr = a.getAddress();
+                        if (addr == null || addr.length != 16) continue;
+                        if (a.isLoopbackAddress() || a.isLinkLocalAddress()
+                                || a.isAnyLocalAddress()) continue;
+                        int first = addr[0] & 0xFF;
+                        if (first == 0xFD) continue;                        // ULA не считается
+                        v6++;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.d(TAG, "ipv6 не удалось определить", e);
+        }
+        stats.log("IPv6 вверх: " + (v6 > 0 ? "есть (" + v6 + " адресов)" : "нет — AAAA из DNS будем убирать"));
+        return v6 > 0;
+    }
+
     /**
      * MTU туннеля = MTU линка минус запас на заголовки. Если поставить 1400 на линке с
      * MTU 1420 (типично для LTE), наши сегменты будут фрагментироваться или теряться —
@@ -276,7 +316,11 @@ public class ZapretService extends VpnService
     private void disallowApplicationSelf(Builder b) {
         try {
             b.addDisallowedApplication(getPackageName());
-        } catch (Exception ignored) { }
+            stats.log("свои сокеты исключены из туннеля");
+        } catch (Exception e) {
+            // Если не вышло, наш же трафик вернётся в туннель кольцом — это нужно видеть.
+            stats.log("ВАЖНО: не удалось исключить своё приложение из туннеля: " + describe(e));
+        }
     }
 
     private void readLoop() {

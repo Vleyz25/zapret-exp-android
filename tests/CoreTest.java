@@ -41,6 +41,7 @@ public class CoreTest {
         testSplits();
         testTcpOptions();
         testWindow();
+        testDnsStripAaaa();
         testShippedConfig(pc);
 
         System.out.println();
@@ -152,30 +153,49 @@ public class CoreTest {
                 7, 'y', 'o', 'u', 't', 'u', 'b', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
         eq("dns: имя запроса", Hello.dnsQueryName(q, 0, q.length), "youtube.com");
 
-        // ответ с одной A-записью 203.0.113.77
-        List<Byte> a = new ArrayList<>();
-        for (byte x : q) a.add(x);
-        a.set(6, (byte) 0); a.set(7, (byte) 1);        // QDCOUNT=1, ANCOUNT=... ниже
-        a.set(8, (byte) 0); a.set(9, (byte) 1);
-        // сжатое имя 0xC0 0x0C, type=1, class=1, ttl=64, rdlength=4
+        // ответ: flags=0x8180 (QR|RA), qd=1, an=1, ns=0, ar=0 — как в реальном трафике
+        byte[] head = new byte[]{0x12, 0x34, (byte) 0x81, (byte) 0x80, 0, 1, 0, 1, 0, 0, 0, 0};
+        byte[] qname = new byte[]{7, 'y', 'o', 'u', 't', 'u', 'b', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
         byte[] rr = new byte[]{(byte) 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 64, 0, 4,
                 (byte) 203, 0, 0x71, 77};
-        byte[] full = new byte[a.size() + rr.length];
-        for (int i = 0; i < a.size(); i++) full[i] = a.get(i);
-        System.arraycopy(rr, 0, full, a.size(), rr.length);
+        byte[] full = join(head, qname, rr);
         List<byte[]> addrs = Hello.dnsAnswerAddresses(full, 0, full.length);
         eq("dns: сколько адресов", addrs.size(), 1);
         eq("dns: адрес из ответа", Bits.addrToString(addrs.get(0)), "203.0.113.77");
 
-        // AAAA-запись: 16 байт
+        // AAAA-запись
         byte[] rr6 = new byte[]{(byte) 0xC0, 0x0C, 0, 28, 0, 1, 0, 0, 0, 64, 0, 16,
                 0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11};
-        byte[] full6 = new byte[a.size() + rr6.length];
-        for (int i = 0; i < a.size(); i++) full6[i] = a.get(i);
-        System.arraycopy(rr6, 0, full6, a.size(), rr6.length);
-        List<byte[]> addrs6 = Hello.dnsAnswerAddresses(full6, 0, full6.length);
+        byte[] headA = new byte[]{0x12, 0x34, (byte) 0x81, (byte) 0x80, 0, 1, 0, 1, 0, 0, 0, 0};
+        List<byte[]> addrs6 = Hello.dnsAnswerAddresses(join(headA, qname, rr6), 0,
+                join(headA, qname, rr6).length);
         eq("dns: AAAA разобрана", addrs6.size(), 1);
         eq("dns: AAAA адрес", Bits.addrToString(addrs6.get(0)), "2001:0:0:0:0:0:0:11");
+
+        // A + AAAA в одном ответе: обе, и порядок сохранён
+        byte[] head2 = new byte[]{0x12, 0x34, (byte) 0x81, (byte) 0x80, 0, 1, 0, 2, 0, 0, 0, 0};
+        byte[] both = join(head2, qname, rr, rr6);
+        List<byte[]> ab = Hello.dnsAnswerAddresses(both, 0, both.length);
+        eq("dns: два адреса из ответа", ab.size(), 2);
+        eq("dns: первый — A", Bits.addrToString(ab.get(0)), "203.0.113.77");
+        // NSCOUNT никогда не должен парситься как ответы
+        byte[] nsOnly = new byte[]{0x12, 0x34, (byte) 0x81, (byte) 0x80, 0, 1, 0, 0, 0, 1, 0, 0};
+        eq("dns: ancount=0 => адресов нет",
+                Hello.dnsAnswerAddresses(join(nsOnly, qname, rr), 0, join(nsOnly, qname, rr).length).size(), 0);
+        // запрос (не ответ) не разбираем как ответ
+        eq("dns: запрос не даёт адресов", Hello.dnsAnswerAddresses(q, 0, q.length).size(), 0);
+    }
+
+    static byte[] join(byte[]... parts) {
+        int n = 0;
+        for (byte[] p : parts) n += p.length;
+        byte[] out = new byte[n];
+        int at = 0;
+        for (byte[] p : parts) {
+            System.arraycopy(p, 0, out, at, p.length);
+            at += p.length;
+        }
+        return out;
     }
 
     // ---- 7. фрагментация: байты не теряются и не дублируются ----
@@ -258,6 +278,50 @@ public class CoreTest {
         // масштабированное окно: 65535 << 7 = 8 МБ, а не 64 КБ
         eq("window: scale=7 даёт 8 МБ окна", Window.allowed(1001, 1000, 65535L << 7), (65535L << 7) - 1);
         eq("window: большое inflight внутри большого окна", Window.allowed(1L << 20, 0L, 4L << 20), 3L << 20);
+    }
+
+    // ---- 9b. DNS: уборка AAAA, когда у оператора нет IPv6-канала ----
+    static void testDnsStripAaaa() throws Exception {
+        java.io.ByteArrayOutputStream d = new java.io.ByteArrayOutputStream();
+        // заголовок: id, flags=ответ+RA, qd=1, an=2, ns=0, ar=0
+        d.write(new byte[]{0x12, 0x34, (byte) 0x81, (byte) 0x80, 0, 1, 0, 2, 0, 0, 0, 0});
+        // вопрос: googlecom , type A, class IN
+        d.write(new byte[]{6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1});
+        // ответ 1: сжатое имя -> A 142.250.90.4
+        d.write(new byte[]{(byte) 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 1, 0x2C, 0, 4,
+                (byte) 142, (byte) 250, 90, 4});
+        // ответ 2: сжатое имя -> AAAA 2a00:1450::1
+        byte[] v6 = new byte[16];
+        v6[0] = 0x2a; v6[1] = 0; v6[2] = 0x14; v6[3] = 0x50; v6[15] = 1;
+        d.write(new byte[]{(byte) 0xC0, 0x0C, 0, 28, 0, 1, 0, 0, 1, 0x2C, 0, 16});
+        d.write(v6);
+        byte[] msg = d.toByteArray();
+
+        eq("dns kinds: A x1, AAAA x1", Hello.dnsAnswerKinds(msg, 0, msg.length), "A x1, AAAA x1");
+
+        byte[] out = Hello.dnsStripAaaa(msg, 0, msg.length);
+        check("dns strip: AAAA убраны", out != null, "");
+        eq("dns strip: ANCOUNT стал 1", ((out[6] & 0xFF) << 8 | (out[7] & 0xFF)), 1);
+        eq("dns strip: длина минус запись AAAA", out.length, msg.length - (2 + 10 + 16));
+        eq("dns strip: вопрос не тронут", Hello.dnsQueryName(out, 0, out.length), "google.com");
+        List<byte[]> addrs = Hello.dnsAnswerAddresses(out, 0, out.length);
+        eq("dns strip: осталась одна A-запись", addrs.size(), 1);
+        eq("dns strip: A-запись не повреждена", Bits.addrToString(addrs.get(0)), "142.250.90.4");
+
+        // только A — трогать нечего
+        java.io.ByteArrayOutputStream d2 = new java.io.ByteArrayOutputStream();
+        d2.write(new byte[]{0x12, 0x34, (byte) 0x81, (byte) 0x80, 0, 1, 0, 1, 0, 0, 0, 0});
+        d2.write(new byte[]{6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1});
+        d2.write(new byte[]{(byte) 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 1, 0x2C, 0, 4,
+                (byte) 142, (byte) 250, 90, 4});
+        byte[] onlyA = d2.toByteArray();
+        check("dns strip: без AAAA возвращаем null", Hello.dnsStripAaaa(onlyA, 0, onlyA.length) == null, "");
+        eq("dns kinds: только A", Hello.dnsAnswerKinds(onlyA, 0, onlyA.length), "A x1");
+
+        // запрос (не ответ) не трогаем
+        byte[] query = new byte[]{0x12, 0x34, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
+        check("dns strip: запрос не трогаем", Hello.dnsStripAaaa(query, 0, query.length) == null, "");
     }
 
     // ---- 8. конфигурация, которая реально лежит в APK ----

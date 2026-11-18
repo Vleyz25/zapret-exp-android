@@ -212,6 +212,13 @@ public final class TcpFlow {
 
     private void run() {
         try {
+            if (v6 && !ZapretService.IPV6_UP) {
+                // без IPv6-канала вверх соединение туда обречено: отвечаем RST сразу,
+                // а не держим клиента 8 секунд на таймауте
+                host.stats().log("нет IPv6 вверх: " + peer + " отклонено");
+                host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.RST, 0, null, 0, 0, 0));
+                return;
+            }
             sock = new Socket();
             // Каждый write() должен уйти сразу одним сегментом, иначе фрагментация
             // ClientHello превратится в «ядро само соберёт как хочет».
@@ -331,7 +338,8 @@ public final class TcpFlow {
                                 advWindow(), null, 0, 0, 0));
                     } catch (Exception ignored) { }
                 } else {
-                    host.stats().log("нет связи с " + peer + ": " + reason(e));
+                    host.stats().log("нет связи с " + peer + " (" + (v6 ? "IPv6" : "IPv4")
+                            + "): " + reason(e));
                     Log.d(TAG, "connect failed", e);
                     try {
                         host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.RST, 0, null, 0, 0, 0));

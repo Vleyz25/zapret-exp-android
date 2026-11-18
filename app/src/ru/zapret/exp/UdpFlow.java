@@ -95,6 +95,14 @@ public final class UdpFlow {
     /** Первая датаграмма потока: по правилу EXP сначала уходят фейки, потом оригинал. */
     public void sendToServer(byte[] data, int off, int len, boolean first) {
         try {
+            if (!ZapretService.IPV6_UP && realV6) {
+                // IPv6-канала у оператора нет — слать туда бессмысленно, и приложение
+                // само выберет IPv4, если мы уберём AAAA из DNS
+                host.stats().log("udp: нет IPv6 вверх, к " + peer + " не идём");
+                host.stats().dropped.incrementAndGet();
+                stop();
+                return;
+            }
             if (srvPort == 53) {
                 dnsQueryName = Hello.dnsQueryName(data, off, len);
                 if (answerFromCache(data, off, len)) return;
@@ -138,16 +146,32 @@ public final class UdpFlow {
                 int n = Os.recvfrom(fd, buf, 0, buf.length, 0, from);
                 if (n <= 0) continue;
                 if (!from.getAddress().equals(dst.getAddress())) continue;   // чужой пакет
+                byte[] out = buf;
+                int outLen = n;
                 if (srvPort == 53) {
                     learnDns(buf, n);
                     storeInCache(buf, n);
+                    String kinds = Hello.dnsAnswerKinds(buf, 0, n);
+                    if (kinds != null && dnsQueryName != null) {
+                        host.stats().log("dns " + dnsQueryName + ": " + kinds);
+                    }
+                    if (!ZapretService.IPV6_UP) {
+                        byte[] stripped = Hello.dnsStripAaaa(buf, 0, n);
+                        if (stripped != null) {
+                            out = stripped;
+                            outLen = stripped.length;
+                            if (dnsQueryName != null) {
+                                host.stats().log("aaaa убраны (" + dnsQueryName + "): IPv6 вверх нет");
+                            }
+                        }
+                    }
                 }
-                host.toTun(Bits.buildUdp(tmpl, buf, 0, n));
-                host.stats().bytesDown.addAndGet(n);
+                host.toTun(Bits.buildUdp(tmpl, out, 0, outLen));
+                host.stats().bytesDown.addAndGet(outLen);
                 lastActivity = System.currentTimeMillis();
             }
         } catch (Exception e) {
-            host.stats().log("udp поток " + peer + " закрыт: " + e);
+            if (!stopped) host.stats().log("udp поток " + peer + " закрыт: " + why(e));
         } finally {
             stop();
         }
@@ -168,9 +192,15 @@ public final class UdpFlow {
         System.arraycopy(c.answer, 0, copy, 0, copy.length);
         copy[0] = req[0];                             // ID запроса этого клиента
         copy[1] = req[1];
-        host.toTun(Bits.buildUdp(tmpl, copy, 0, copy.length));
+        byte[] out = copy;
+        int outLen = copy.length;
+        if (!ZapretService.IPV6_UP) {
+            byte[] stripped = Hello.dnsStripAaaa(copy, 0, copy.length);
+            if (stripped != null) { out = stripped; outLen = stripped.length; }
+        }
+        host.toTun(Bits.buildUdp(tmpl, out, 0, outLen));
         host.stats().dnsCached.incrementAndGet();
-        host.stats().bytesDown.addAndGet(copy.length);
+        host.stats().bytesDown.addAndGet(outLen);
         host.stats().log("dns кэш: " + name + " -> " + peer);
         lastActivity = System.currentTimeMillis();
         return true;
@@ -200,6 +230,17 @@ public final class UdpFlow {
                 host.stats().dnsLearned.incrementAndGet();
             }
         } catch (Exception ignored) { }
+    }
+
+    /** Текст ошибки: ErrnoException прячет смысл в errno, а не в getMessage(). */
+    private static String why(Exception e) {
+        if (e instanceof android.system.ErrnoException) {
+            android.system.ErrnoException ee = (android.system.ErrnoException) e;
+            return (ee.getMessage() == null ? "syscall" : ee.getMessage())
+                    + ": " + Os.strerror(ee.errno) + " (errno=" + ee.errno + ")";
+        }
+        String m = e.getMessage();
+        return (m == null || m.isEmpty()) ? e.getClass().getSimpleName() : m;
     }
 
     public void stop() {
