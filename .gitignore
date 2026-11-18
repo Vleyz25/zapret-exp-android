@@ -1,0 +1,13 @@
+# сборка
+build/
+gen/
+app/dist/
+*.apk
+*.ap_
+# ключ подписи — в git не должен попадать никогда
+keys/
+*.keystore
+*.jks
+# локальное
+*.log
+.DS_Store

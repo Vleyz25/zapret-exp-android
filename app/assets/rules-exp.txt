@@ -1,0 +1,50 @@
+# general (EXP) — перенос блоков winws.exe из zapret-discord-youtube 1.10.4
+# (C:\Users\Admin\OneDrive\Desktop\zapret-discord-youtube-1.10.4\general (EXP).bat)
+#
+# формат строки:  имя | протокол | порты | списки | параметры
+#   протокол : tcp | udp | both
+#   списки   : имена файлов из assets/pc (без .txt); * = любое назначение
+#              (в этом списке состоят исключения list-exclude — см. Profile.excludes)
+#   параметры: fake=<файл .bin из pc>, repeat=<кол-во фейков (--dpi-desync-repeats)>,
+#              ttl=<TTL/hop limit фейка (--dpi-desync-fooling в winws делает то же:
+#              пакет должен быть виден DPI и не долететь до сервера)>,
+#              split=<позиция:повторы:шаг> (--dpi-desync-split-pos=1 + repeats),
+#              sni=<домен>  (аналог --dpi-desync-hostfakesplit-mod=host=...)
+#
+# Правила применяются по порядку, первое совпадение выигрывает — как блоки,
+# разделённые --new в bat-файле.
+
+# EXP блок 1: --filter-l7=quic --dpi-desync=fake --dpi-desync-repeats=11
+#            --dpi-desync-fake-quic=quic_initial_www_google_com.bin по list-general
+# списки: general + google, чтобы фейки шли только к адресам, которые мы сами
+# разрешили в Discord/Cloudflare/YouTube (адрес берётся из наших DNS-ответов)
+quic-general|udp|443,8443|zapret-general,zapret-google|fake=quic_initial_www_google_com.bin,repeat=11,ttl=8
+
+# EXP блок 2: --filter-udp=19294-19344,50000-50100 --filter-l7=discord,stun,unknown
+#            --dpi-desync=fake --dpi-desync-repeats=4 (ACTIVE_DISCORD_UDP.bin)
+discord-udp|udp|19294-19344,50000-50100|*|fake=ACTIVE_DISCORD_UDP.bin,repeat=4,ttl=8
+
+# EXP блок 3: --filter-tcp=2053,2083,2087,2096,8443 --hostlist-domains=discord.media
+#            --dpi-desync=fake,multisplit --split-pos=1 --repeats=8
+discord-cdn|tcp|2053,2083,2087,2096,8443|discordmedia|fake=tls_clienthello_www_google_com.bin,split=1:8:1,ttl=8
+
+# EXP блок 4: --filter-tcp=443 --hostlist=list-google.txt
+#            --dpi-desync=hostfakesplit --dpi-desync-hostfakesplit-mod=host=www.google.com
+google-youtube|tcp|443|zapret-google|fake=tls_clienthello_www_google_com.bin,sni=www.google.com,split=1,ttl=8
+
+# EXP блок 5 (основной): --filter-tcp=80,443 --hostlist=list-general.txt
+#            --dpi-desync=fake,multisplit --split-pos=1 --seqovl=480 --repeats=4
+#            --dpi-desync-fake-tls=tls_clienthello_www_sferum_ru.bin
+general-main|tcp|80,443|zapret-general,zapret-google|fake=tls_clienthello_www_sferum_ru.bin,split=1:4:1,ttl=8
+
+# Запасной вариант вместо блоков 6-9: они в твоём паке опираются на ipset-all.txt,
+# где сейчас одна заглушка 203.0.113.113/32, то есть на ПК не обрабатывают ничего.
+# Здесь это правило по умолчанию выключено: фейки на «любое» UDP:443 — шум в чужие
+# сервисы. Если твой провайдер душит QUIC по адресам, которых нет в списках,
+# разкомментируй строку ниже (и при желании уменьши repeat).
+# quic-any|udp|443|*|fake=quic_initial_www_google_com.bin,repeat=11,ttl=8
+
+# Вариант «заблокировать QUIC», если провайдер умеет резать QUIC, а TCP работает:
+# приложение отбрасывает UDP:443, и YouTube/Discord сами уходят на TCP+TLS,
+# где включена фрагментация. Раскомментируй, если с фейками хуже.
+# quic-block|udp|443|*|drop=1
