@@ -31,6 +31,8 @@ public final class Config {
         public int splitSkip = 0;
         public String sni;
         public boolean drop;
+        /** Эксперимент: TCP_MAXSEG, чтобы ядро дробило запрос мельче (0 = выключено). */
+        public int mss;
 
         public boolean portsMatch(int port) {
             for (int i = 0; i < portLo.length; i++) {
@@ -129,6 +131,8 @@ public final class Config {
                 r.sni = v;
             } else if (k.equals("drop")) {
                 r.drop = intSafe(v, 0) != 0;
+            } else if (k.equals("mss")) {
+                r.mss = intSafe(v, 0);
             } else if (k.equals("split")) {
                 String[] sp = v.split(":");
                 r.splitPos = intSafe(sp[0], 1);

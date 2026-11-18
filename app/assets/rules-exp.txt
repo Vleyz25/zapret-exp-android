@@ -1,15 +1,22 @@
-# general (EXP) — перенос блоков winws.exe из zapret-discord-youtube 1.10.4
-# (C:\Users\Admin\OneDrive\Desktop\zapret-discord-youtube-1.10.4\general (EXP).bat)
+# general (EXP) — перенос блоков winws.exe из general (EXP).bat
+# (пак zapret-discord-youtube 1.10.4: https://github.com/Flowseal/zapret-discord-youtube)
 #
 # формат строки:  имя | протокол | порты | списки | параметры
 #   протокол : tcp | udp | both
 #   списки   : имена файлов из assets/pc (без .txt); * = любое назначение
-#              (в этом списке состоят исключения list-exclude — см. Profile.excludes)
-#   параметры: fake=<файл .bin из pc>, repeat=<кол-во фейков (--dpi-desync-repeats)>,
-#              ttl=<TTL/hop limit фейка (--dpi-desync-fooling в winws делает то же:
-#              пакет должен быть виден DPI и не долететь до сервера)>,
-#              split=<позиция:повторы:шаг> (--dpi-desync-split-pos=1 + repeats),
-#              sni=<домен>  (аналог --dpi-desync-hostfakesplit-mod=host=...)
+#              (списки исключений list-exclude применяются ко всем правилам — Profile.excludes)
+#   параметры:
+#     fake=<файл .bin из pc>     — байты фейка (--dpi-desync-fake-tls/-quic/-udp)
+#     repeat=<N>                 — сколько фейков (--dpi-desync-repeats)
+#     ttl=<N>                    — TTL/hop limit фейка: пакет должен быть виден инспекции
+#                                  и не долететь до сервера (на ПК это делает --fooling=ts)
+#     split=<позиция:повторы:шаг> — точки фрагментации запроса
+#                                  (--dpi-desync-split-pos=1 + --dpi-desync-repeats)
+#     sni=<домен>                — подмена имени в фейке
+#                                  (аналог --dpi-desync-hostfakesplit-mod=host=...)
+#     drop=1                     — отбрасывать поток вместо десинхронизации
+#     mss=<байт>                 — эксперимент: TCP_MAXSEG, чтобы запрос шёл ещё более
+#                                  мелкими сегментами (0 = выключено)
 #
 # Правила применяются по порядку, первое совпадение выигрывает — как блоки,
 # разделённые --new в bat-файле.
@@ -37,10 +44,10 @@ google-youtube|tcp|443|zapret-google|fake=tls_clienthello_www_google_com.bin,sni
 #            --dpi-desync-fake-tls=tls_clienthello_www_sferum_ru.bin
 general-main|tcp|80,443|zapret-general,zapret-google|fake=tls_clienthello_www_sferum_ru.bin,split=1:4:1,ttl=8
 
-# Запасной вариант вместо блоков 6-9: они в твоём паке опираются на ipset-all.txt,
+# Запасной вариант вместо блоков 6-9: они в папке zapret опираются на ipset-all.txt,
 # где сейчас одна заглушка 203.0.113.113/32, то есть на ПК не обрабатывают ничего.
 # Здесь это правило по умолчанию выключено: фейки на «любое» UDP:443 — шум в чужие
-# сервисы. Если твой провайдер душит QUIC по адресам, которых нет в списках,
+# сервисы. Если провайдер душит QUIC по адресам, которых нет в списках,
 # разкомментируй строку ниже (и при желании уменьши repeat).
 # quic-any|udp|443|*|fake=quic_initial_www_google_com.bin,repeat=11,ttl=8
 

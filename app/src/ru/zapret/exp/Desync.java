@@ -56,6 +56,16 @@ public final class Desync {
         } catch (ErrnoException e) {
             Log.d(TAG, "TCP_NODELAY: " + e);
         }
+        // Дополнительный рычаг: уменьшить MSS, чтобы ClientHello шёл ещё более
+        // мелкими сегментами. Байты не меняются, поток остаётся валидным.
+        if (r != null && r.mss >= 88) {
+            try {
+                Os.setsockoptInt(fd, IPPROTO_TCP_LEVEL, TCP_MAXSEG, r.mss);
+                stats.desyncTls.incrementAndGet();
+            } catch (ErrnoException e) {
+                Log.d(TAG, "TCP_MAXSEG: " + e);
+            }
+        }
 
         try {
             if (r == null) {

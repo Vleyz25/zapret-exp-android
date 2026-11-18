@@ -1,29 +1,54 @@
 #!/usr/bin/env bash
 # Сборка APK «Запрет (EXP)» без Gradle, без NDK, без сети.
 #
-# Исходники лежат в D:/Проекты/... (кириллица), но aapt2 в Windows не переваривает
-# не-ASCII в путях аргументов, поэтому сборка идёт в ASCII- staging каталоге,
-# а готовый APK копируется обратно к исходникам.
+#   aapt2 compile -> aapt2 link -> javac -> d8 -> вшивка classes.dex -> zipalign -> apksigner
+#
+# Нужны только JDK 17 и Android SDK (platform + build-tools), дальше всё штатные утилиты.
+# Пути задаются переменными окружения (JAVA_HOME / ANDROID_HOME) или файлом local.env
+# в корне репозитория — он не попадает в git (см. .gitignore), там же ключ и его пароль.
+#
+#   JAVA_HOME=/c/tools/jdk-17 ANDROID_HOME=/c/tools/android/sdk \
+#   KEY=keys/my.keystore KSAlias=my KSPass='секрет' bash app/build.sh Zapret-EXP
+#
 set -euo pipefail
 
-SRC="D:/Проекты/zapret-exp-android/app"
-STAGE="D:/zapret-build"
-SDK="D:/Утилиты/AndroidBuildTools/sdk"
-BT="$SDK/build-tools/34.0.0"
-AJ="$SDK/platforms/android-34/android.jar"
-JDK="D:/Утилиты/AndroidBuildTools/jdk/jdk-17.0.20.1+1"
-KEY="D:/Проекты/zapret-exp-android/keys/zapret-exp.keystore"
-KSPASS="zapret-exp"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"      # .../<repo>/app
+ROOT="$(cd "$HERE/.." && pwd)"                            # корень репозитория
+if [ -f "$ROOT/local.env" ]; then . "$ROOT/local.env"; fi
+
+SDK="${SDK:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}}"
+JDK="${JDK:-${JAVA_HOME:-}}"
+BUILD_TOOLS="${BUILD_TOOLS:-34.0.0}"
+PLATFORM="${PLATFORM:-android-34}"
+KEY="${KEY:-$ROOT/keys/zapret-exp.keystore}"
+KSAlias="${KSAlias:-zapret-exp}"
+KSPass="${KSPass:-}"
+
 MINAPI=24
 TARGETAPI=34
 VERCODE="${VERCODE:-1}"
 VERNAME="${VERNAME:-1.0}"
 NAME="${1:-Zapret-EXP}"
 
-echo "### 0. staging в ASCII-путь"
+# aapt2 в Windows не читает не-ASCII пути в аргументах, поэтому сборка идёт в
+# staging-каталоге с ASCII-путём. Готовый APK скрипт копирует обратно к исходникам.
+STAGE="${STAGE:-/tmp/zapret-build}"
+BT="$SDK/build-tools/$BUILD_TOOLS"
+AJ="$SDK/platforms/$PLATFORM/android.jar"
+
+if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then echo "Не задан SDK (ANDROID_HOME или SDK= в local.env)"; exit 1; fi
+if [ -z "$JDK" ] || [ ! -d "$JDK" ]; then echo "Не задан JDK (JAVA_HOME или JDK= в local.env)"; exit 1; fi
+if [ ! -f "$AJ" ]; then echo "Нет платформы: $AJ"; exit 1; fi
+if [ ! -f "$KEY" ]; then echo "Нет ключа подписи: $KEY (создай: keytool -genkeypair -keystore keys/my.keystore -alias my -keyalg RSA -keysize 2048 -validity 10000)"; exit 1; fi
+if [ -z "$KSPass" ]; then echo "Задай пароль ключа: KSPass='...' (или в local.env)"; exit 1; fi
+case "$STAGE" in
+    *[!a-zA-Z0-9/._:-]*) echo "STAGE должен быть ASCII-путём, сейчас: $STAGE"; exit 1 ;;
+esac
+
+echo "### 0. staging: $STAGE"
 mkdir -p "$STAGE"
-for d in src res assets tools; do rm -rf "$STAGE/$d"; cp -r "$SRC/$d" "$STAGE/$d"; done
-cp "$SRC/AndroidManifest.xml" "$STAGE/AndroidManifest.xml"
+for d in src res assets tools; do rm -rf "$STAGE/$d"; cp -r "$HERE/$d" "$STAGE/$d"; done
+cp "$HERE/AndroidManifest.xml" "$STAGE/AndroidManifest.xml"
 cp "$AJ" "$STAGE/android.jar"
 cp "$KEY" "$STAGE/app.keystore"
 rm -rf "$STAGE/gen" "$STAGE/build" "$STAGE/dist"
@@ -37,7 +62,7 @@ echo "### 1. иконка"
 echo "### 2. aapt2 compile"
 "$BT/aapt2.exe" compile --dir res -o gen/res.zip
 
-echo "### 3. aapt2 link"
+echo "### 3. aapt2 link (min $MINAPI / target $TARGETAPI / $VERNAME)"
 "$BT/aapt2.exe" link --auto-add-overlay \
   -I android.jar \
   --manifest AndroidManifest.xml \
@@ -74,33 +99,32 @@ for it in zin.infolist():
     zout.writestr(it, zin.read(it.filename))
 zout.write("build/dex/classes.dex", "classes.dex")
 zout.close(); zin.close()
-print("dex вшит")
+print("  dex вшит")
 PY
 
 echo "### 7. zipalign + подпись"
 "$BT/zipalign.exe" -f 4 build/app.unsigned.apk build/app.aligned.apk
 APKSIGNER="$JDK/bin/java.exe -cp $BT/lib/apksigner.jar com.android.apksigner.ApkSignerTool"
 $APKSIGNER sign \
-  --ks app.keystore --ks-key-alias zapret-exp --ks-pass "pass:$KSPASS" --key-pass "pass:$KSPASS" \
+  --ks app.keystore --ks-key-alias "$KSAlias" --ks-pass "pass:$KSPass" --key-pass "pass:$KSPass" \
   --min-sdk-version $MINAPI --out "dist/$NAME.apk" build/app.aligned.apk
+rm -f app.keystore
 
 echo "### 8. проверка"
-$APKSIGNER verify --print-certs "dist/$NAME.apk" | head -5
+$APKSIGNER verify "dist/$NAME.apk" && echo "  подпись OK"
 echo "--- badging ---"
-"$BT/aapt2.exe" dump badging "dist/$NAME.apk" | grep -E "^(package|application-label|launchable-activity|sdkVersion|targetSdkVersion|uses-permission|density|icon)" | sed 's/^/  /'
+"$BT/aapt2.exe" dump badging "dist/$NAME.apk" | grep -E "^(package|application-label|launchable-activity|sdkVersion|targetSdkVersion|uses-permission)" | sed 's/^/  /'
 echo "--- содержимое ---"
 python - "$NAME" <<'PY'
 import sys, zipfile
 z = zipfile.ZipFile("dist/%s.apk" % sys.argv[1])
 n = [i.filename for i in z.infolist()]
 print("  файлов:", len(n))
-print("  assets:", sorted(x for x in n if x.startswith("assets/")))
+print("  assets:", len([x for x in n if x.startswith("assets/")]), sorted(x.split("/")[-1] for x in n if x.startswith("assets/")))
 print("  dex:", [x for x in n if x.endswith(".dex")])
 PY
 
-rm -f app.keystore   # копия ключа в staging не должна оставаться
-
-echo "### 9. копирование APK к исходникам"
-mkdir -p "$SRC/dist"
-cp "dist/$NAME.apk" "$SRC/dist/$NAME.apk"
-ls -la "$SRC/dist/"
+echo "### 9. APK к исходникам"
+mkdir -p "$HERE/dist"
+cp "dist/$NAME.apk" "$HERE/dist/$NAME.apk"
+echo "готово: $HERE/dist/$NAME.apk"

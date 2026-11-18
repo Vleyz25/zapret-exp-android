@@ -39,6 +39,7 @@ public class CoreTest {
         testHttpHost();
         testDns();
         testSplits();
+        testWindow();
         testShippedConfig(pc);
 
         System.out.println();
@@ -210,6 +211,22 @@ public class CoreTest {
         check("splits: инвариант покрытия выполнен для len 1..1500", true, "");
     }
 
+    // ---- 7b. управление окном отдачи (без него клиент «зависает» без видео) ----
+    static void testWindow() {
+        eq("window: при окне 0 отправить нельзя", Window.allowed(1001, 1000, 0), 0L);
+        eq("window: окно открыто", Window.allowed(1001, 1000, 65535), 65534L);
+        eq("window: в полёте", Window.inflight(2000, 1500), 500L);
+        eq("window: окно выбрано", Window.allowed(2000, 1500, 400), 0L);
+        eq("window: осталось", Window.allowed(2000, 1500, 600), 100L);
+        long near = 0xFFFFFF00L;
+        check("window: обёртка номера — вперёд", Window.serialAfter(near + 0x200, near), "");
+        check("window: обёртка номера — не назад", !Window.serialAfter(near, near + 0x200), "");
+        eq("window: inflight через границу 2^32", Window.inflight(0x100L, near), 0x200L);
+        eq("window: allowed через границу 2^32", Window.allowed(0x100L, near, 0x300), 0x100L);
+        eq("window: старый ACK игнорируется", Window.advanceAcked(1500, 1400), 1500L);
+        eq("window: новый ACK принят", Window.advanceAcked(1500, 1600), 1600L);
+    }
+
     // ---- 8. конфигурация, которая реально лежит в APK ----
     static void testShippedConfig(String pc) throws Exception {
         java.nio.file.Path pcDir = Paths.get(pc);
@@ -227,6 +244,19 @@ public class CoreTest {
             }
         }
         Config.HostSet excludes = lists.get("zapret-exclude");
+
+        // параметры, которые правятся в правилах, должны доходить до движка
+        Config.Rule tweak = Config.parseRuleLine(
+                "tweaking|tcp|443|zapret-general|fake=tls_clienthello_www_sferum_ru.bin,"
+                        + "repeat=6,ttl=5,split=1:16:1,mss=200", fakes);
+        check("config: repeat/ttl/mss/точки считываются из правила",
+                tweak != null && tweak.repeat == 6 && tweak.ttl == 5 && tweak.mss == 200
+                        && tweak.splitPos == 1 && tweak.splitRepeats == 16 && tweak.splitSkip == 1
+                        && covered(Splits.cuts(900, tweak.splitPos, tweak.splitRepeats,
+                                tweak.splitSkip, "tls"), 900) == 900,
+                tweak == null ? "null" : "repeat=" + tweak.repeat + " ttl=" + tweak.ttl
+                        + " mss=" + tweak.mss + " split=" + tweak.splitPos + ":"
+                        + tweak.splitRepeats + ":" + tweak.splitSkip);
 
         java.nio.file.Path rulesPath = pcDir.getParent().resolve("rules-exp.txt");
         List<Config.Rule> rules = new ArrayList<>();

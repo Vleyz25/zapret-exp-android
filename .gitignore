@@ -8,6 +8,8 @@ app/dist/
 keys/
 *.keystore
 *.jks
-# локальное
+# локальное (пути и ключ этой машины)
+local.env
+.build/
 *.log
 .DS_Store
