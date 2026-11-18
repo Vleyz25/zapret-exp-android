@@ -29,6 +29,7 @@ public class MainActivity extends Activity {
     private TextView logText;
     private ScrollView logScroll;
 
+    private static final int REQ_VPN = 20;
     private boolean pendingStart;
     private Profile profile;
 
@@ -84,10 +85,13 @@ public class MainActivity extends Activity {
     private void requestAndStart() {
         Intent pre = VpnService.prepare(this);
         if (pre != null) {
+            // Экран согласия системы — ждём его результат именно здесь. Раньше полагались
+            // на onResume, и на некоторых оболочках (HiOS у Tecno) тумблер успевал
+            // отжаться, пока диалог ещё не показан.
             pendingStart = true;
             statusText.setText(R.string.need_permission);
             try {
-                startActivity(pre);
+                startActivityForResult(pre, REQ_VPN);
             } catch (Exception e) {
                 statusText.setText("Не удалось запросить разрешение: " + e);
                 pendingStart = false;
@@ -95,6 +99,20 @@ public class MainActivity extends Activity {
             }
         } else {
             startZapret();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != REQ_VPN) return;
+        pendingStart = false;
+        if (res == RESULT_OK) {
+            startZapret();
+        } else {
+            power.setChecked(false);
+            ZapretService.lastError = "системный экран VPN-разрешения закрыт без согласия";
+            refresh();
         }
     }
 
@@ -121,7 +139,7 @@ public class MainActivity extends Activity {
                 registerReceiver(tick, new IntentFilter(ZapretService.ACTION_TICK));
             }
         } catch (Exception ignored) { }
-        power.setChecked(ZapretService.running);
+        if (!pendingStart) power.setChecked(ZapretService.running);
         if (pendingStart && VpnService.prepare(this) == null) {
             pendingStart = false;
             startZapret();
@@ -139,23 +157,42 @@ public class MainActivity extends Activity {
 
     private void refresh() {
         boolean on = ZapretService.running;
-        power.setChecked(on);
+        if (!pendingStart) power.setChecked(on);
         statusText.setText(on ? R.string.switch_on : R.string.switch_off);
+        Stats s = ZapretService.liveStats;
         if (!on) {
-            statsText.setText("Выключено. Списков: " + profile.domainCount() + " доменов, правил: "
-                    + profile.rules.size());
+            StringBuilder err = new StringBuilder();
+            if (ZapretService.lastError != null) {
+                err.append("Причина отказа: ").append(ZapretService.lastError).append('\n');
+            }
+            err.append("Выключено. Списков: ").append(profile.domainCount())
+                    .append(" доменов, правил: ").append(profile.rules.size());
+            statsText.setText(err.toString());
+            if (s != null) showLog(s);
+            // после отказа разблокируем тумблер, чтобы второй нажатие сработало
+            if (!pendingStart) power.setChecked(false);
             return;
         }
-        Stats s = ZapretService.liveStats;
         if (s == null) return;
         statsText.setText(String.format(getString(R.string.stats_format),
                 s.tcpFlows.get(), s.udpFlows.get(), s.desyncTls.get(), s.desyncHttp.get(),
                 s.desyncQuic.get(), profile.domainCount(),
                 Bits.human(s.bytesDown.get()), Bits.human(s.bytesUp.get())));
+        showLog(s);
+    }
+
+    /** Журнал показываем и в выключенном состоянии: в нём причина отказа. */
+    private void showLog(final Stats s) {
         List<String> lines = s.logCopy();
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < Math.min(lines.size(), 40); i++) sb.append(lines.get(i)).append('\n');
         logText.setText(sb.toString());
+        logScroll.post(new Runnable() {
+            @Override
+            public void run() {
+                logScroll.fullScroll(android.view.View.FOCUS_DOWN);
+            }
+        });
     }
 
 }

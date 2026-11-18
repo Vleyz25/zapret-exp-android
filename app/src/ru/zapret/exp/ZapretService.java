@@ -51,6 +51,8 @@ public class ZapretService extends VpnService
     private static final String CHANNEL = "tunel";
 
     public static volatile boolean running;
+    /** Причина последнего отказа — обязана быть видна на экране. */
+    public static volatile String lastError;
     /** Статистика активного сервиса, чтобы экран мог её показать. */
     public static volatile Stats liveStats;
 
@@ -87,8 +89,34 @@ public class ZapretService extends VpnService
         }
         if (running) return START_STICKY;
 
-        startForegroundNotification();
-        if (!openTunel()) {
+        // статистика и журнал должны быть видны экрану даже если старт не удался
+        liveStats = stats;
+        lastError = null;
+
+        // Сначала поднимаем туннель: если не вышло — причина именно в VPN-разрешении
+        // или в конфигурации туннеля, и она появится на экране. Иначе первым идёт
+        // foreground-сервис, и отказ системы про туннель вообще ничего не скажет.
+        boolean tunels = false;
+        try {
+            tunels = openTunel();
+        } catch (Exception e) {
+            fail("туннель не поднялся: " + describe(e));
+        }
+        if (!tunels) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        // Сервис запущен через startForegroundService, значит startForeground обязан
+        // отработать в ближайшие секунды, иначе система убьёт процесс без объяснений.
+        boolean fg = false;
+        try {
+            fg = startForegroundNotification();
+        } catch (Exception e) {
+            fail("foreground-сервис не принят системой: " + describe(e));
+        }
+        if (!fg) {
+            // Туннель рабочий, но удерживать процесс нечем: останавливаемся честно.
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -132,16 +160,71 @@ public class ZapretService extends VpnService
 
     // ---------------------------------------------------------------- туннель
 
+    /** Отказ: записать в журнал, показать на экране и остановить сервис. */
+    private void fail(String reason) {
+        lastError = reason;
+        stats.log(reason);
+        Log.e(TAG, reason);
+        running = false;
+        try { sendBroadcast(new Intent(ACTION_TICK).setPackage(getPackageName())); }
+        catch (Exception ignored) { }
+    }
+
+    /** Текст исключения: Android часто кладёт причину в getCause()/getMessage(). */
+    private static String describe(Throwable t) {
+        String s = t.getClass().getSimpleName();
+        if (t.getMessage() != null && !t.getMessage().isEmpty()) s += ": " + t.getMessage();
+        Throwable c = t.getCause();
+        if (c != null && c.getMessage() != null) s += " <- " + c.getClass().getSimpleName() + ": " + c.getMessage();
+        return s;
+    }
+
+    /**
+     * Поднимаем туннель. Оболочки (HiOS у Tecno, MIUI, OneUI) по-разному переваривают
+     * IPv6-адрес и свои DNS внутри туннеля, поэтому перебираем варианты от полного
+     * набора к минимальному и пишем в журнал, какой сработал.
+     */
     private boolean openTunel() {
-        try {
+        String[] tried = new String[3];
+        Exception[] errs = new Exception[3];
+        boolean[] variants = {true, false, false};        // ipv6+свой dns | ipv6 | только v4
+        for (int i = 0; i < 3; i++) {
+            tried[i] = i == 0 ? "v4+v6, свой DNS" : (i == 1 ? "v4+v6, системный DNS" : "только v4");
+            try {
+                if (buildTunnel(i == 0 || i == 1, i == 0)) {
+                    stats.log("туннель: " + tried[i] + " — ок");
+                    return true;
+                }
+                errs[i] = new Exception("establish вернул null");
+                stats.log("туннель: " + tried[i] + " — establish вернул null");
+            } catch (Exception e) {
+                errs[i] = e;
+                stats.log("туннель: " + tried[i] + " — " + describe(e));
+                try { if (tun != null) { tun.close(); tun = null; } } catch (Exception ignored) { }
+            }
+        }
+        StringBuilder why = new StringBuilder("туннель не поднялся ни в одном варианте");
+        for (int i = 0; i < 3; i++) {
+            if (errs[i] != null) why.append('\n').append(tried[i]).append(": ").append(describe(errs[i]));
+        }
+        fail(why.toString());
+        return false;
+    }
+
+    /** ownDns=false — приложения резолвятся системными серверами, запросы всё равно идут через туннель. */
+    private boolean buildTunnel(boolean ipv6, boolean ownDns) throws Exception {
             Builder b = new Builder();
             b.setSession("Запрет (EXP)");
             b.addAddress(TUN_IP_V4, 32);
             b.addRoute("0.0.0.0", 0);
-            b.addAddress(TUN_IP_V6, 64);
-            b.addRoute("::", 0);
-            b.addDnsServer(TUN_DNS_V4);
-            b.addDnsServer(TUN_DNS_V6);
+            if (ipv6) {
+                b.addAddress(TUN_IP_V6, 64);
+                b.addRoute("::", 0);
+            }
+            if (ownDns) {
+                b.addDnsServer(TUN_DNS_V4);
+                if (ipv6) b.addDnsServer(TUN_DNS_V6);
+            }
             b.setMtu(MTU);
             // Чтение из туннеля должно блокироваться, а не возвращать EAGAIN.
             // setBlocking появился в API 30, на более старых дефолт и так приемлемый.
@@ -153,24 +236,16 @@ public class ZapretService extends VpnService
             disallowApplicationSelf(b);
 
             tun = b.establish();
-            if (tun == null) {
-                stats.log("не удалось поднять туннель (нет разрешения)");
-                return false;
-            }
+            if (tun == null) return false;
             reader = new Thread(new Runnable() {
                 @Override
                 public void run() {
                     readLoop();
                 }
             }, "tun-read");
-            reader.setDaemon(true);
-            reader.start();
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "establish()", e);
-            stats.log("ошибка туннеля: " + e);
-            return false;
-        }
+        reader.setDaemon(true);
+        reader.start();
+        return true;
     }
 
     /** Наш собственный трафик не должен попадать в туннель (иначе кольцо). */
@@ -451,7 +526,7 @@ public class ZapretService extends VpnService
         }
     }
 
-    private void startForegroundNotification() {
+    private boolean startForegroundNotification() {
         Intent i = new Intent(this, MainActivity.class);
         PendingIntent pi = PendingIntent.getActivity(this, 0, i,
                 Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
@@ -471,11 +546,37 @@ public class ZapretService extends VpnService
                         getString(R.string.notif_stop), stopPi).build())
                 .setOngoing(true)
                 .build();
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED);
-        } else {
+        if (Build.VERSION.SDK_INT < 29) {
             startForeground(NOTIF_ID, n);
+            return true;
         }
+        // Android 14+ (targetSdk 34) обязателен тип foreground-сервиса. Для VPN-приложений
+        // штатный вариант — specialUse с подтипом vpn в манифесте; systemExempted принимает
+        // не каждая оболочка, а на Android 10-13 тип можно вообще не указывать.
+        // Перебираем по порядку, чтобы приложение не умирало молча.
+        Exception last = null;
+        int[] types = Build.VERSION.SDK_INT >= 34
+                ? new int[]{android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED,
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE}
+                : new int[]{android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED,
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE};
+        for (int t : types) {
+            try {
+                if (t == android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE) {
+                    startForeground(NOTIF_ID, n);
+                } else {
+                    startForeground(NOTIF_ID, n, t);
+                }
+                if (t != types[0]) stats.log("foreground-сервис запущен с типом " + t);
+                return true;
+            } catch (Exception e) {
+                last = e;
+                stats.log("тип foreground-сервиса " + t + " не принят: " + describe(e));
+            }
+        }
+        fail("не удалось перевести сервис в foreground: " + describe(last));
+        return false;
     }
 
     /** Статистика для интерфейса. */
