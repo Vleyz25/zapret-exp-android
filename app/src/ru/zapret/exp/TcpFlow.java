@@ -1,12 +1,15 @@
 package ru.zapret.exp;
 
-import android.system.Os;
-import android.system.OsConstants;
-import android.system.StructPollfd;
 import android.util.Log;
 
 import java.io.FileDescriptor;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.ArrayDeque;
 
 /**
@@ -19,23 +22,27 @@ import java.util.ArrayDeque;
  * появляется возможность переформатировать исходящий запрос (фрагментация ClientHello) —
  * то же на ПК делает winws.exe через WinDivert.
  *
- * два направления, два «окна»:
- *   вверх (клиент -> сервер)  — очередь queue, переполнение = объявляем окно 0;
- *   вниз (сервер -> клиент)  — очередь outQueue, отправляем не больше окна клиента
- *                              (Window.allowed), иначе данные ушли бы сверх window,
- *                              клиент бы их отбросил, а повторной передачи у нас нет.
+ * Два направления и два «окна»:
+ *   вверх (клиент -> сервер) — очередь queue; переполнение = объявляем окно 0;
+ *   вниз (сервер -> клиент) — очередь outQueue; отправляем не больше окна клиента.
+ *
+ * Окна масштабированы (RFC 7323): без window scaling потолок приёма — 65535 байт на
+ *один круг задержки, то есть порядка 1 МБ/с на мобильном RTT, и скорость интернета упиралась бы в нас.
+ * Мы объявляем wscale=4 (до 1 МБ), а окно клиента умножаем на его собственный scale из
+ * опций SYN — иначе сами себе ограничивали отдачу в 64 КБ.
  */
 public final class TcpFlow {
 
     private static final String TAG = "TcpFlow";
-    private static final int MSS = 1360;
-    private static final int MAX_QUEUE = 1 << 20;       // вверх, 1 МБ
-    private static final int MAX_OUT = 8 << 20;         // вниз, 8 МБ
+    private static final int OUR_SCALE = 4;              // наше окно: 65535 << 4 ~= 1 МБ
+    private static final int MAX_QUEUE = 1 << 20;        // вверх, 1 МБ
+    private static final int MAX_OUT = 8 << 20;          // вниз, 8 МБ
     private static final long IDLE_MS = 300_000;
+    private static final long BLOCKED_MS = 45_000;
+    private static final int CONNECT_MS = 8000;
+    private static final int READ_WAIT_MS = 4000;
     /** Сколько молча переживаем «хвосты» закрытого соединения, чтобы не слать RST. */
     public static final long GRACE_MS = 15_000;
-    /** Сколько ждём, пока клиент откроет окно, прежде чем признать поток мёртвым. */
-    private static final long BLOCKED_MS = 45_000;
 
     /** То, что поток требует от сервиса. */
     public interface Host {
@@ -61,11 +68,12 @@ public final class TcpFlow {
     private final String key;
     private String peer;
 
-    private final long iss, irs;
+    private final long iss;
     // rcvNxt пишет только читающий поток туннеля, sndNxt — только рабочий поток;
     // volatile нужен, потому что оба потока читают значение друг друга.
     private volatile long rcvNxt, sndNxt;
-    private volatile long peerWindow = 65535;
+    private final int peerScale;
+    private volatile long peerWindow;                     // уже масштабированное
     private volatile long peerAcked;
 
     private final ArrayDeque<byte[]> queue = new ArrayDeque<>();       // клиент -> сервер
@@ -74,11 +82,14 @@ public final class TcpFlow {
     private final Object lock = new Object();
 
     private Thread worker;
-    private FileDescriptor fd;
+    private Socket sock;
+    private OutputStream out;
+    private InputStream in;
     private volatile boolean stopped, firstSent, clientDone, eofFromServer, ready;
     private volatile long lastActivity = System.currentTimeMillis();
     private volatile long closedAt;
     private long blockedSince;
+    private long lastSynAckAt;
 
     public TcpFlow(Host host, Bits.Pkt syn, String key) {
         this.host = host;
@@ -90,10 +101,12 @@ public final class TcpFlow {
         this.cliPort = syn.sport;
         this.peer = Bits.addrToString(syn.dst) + ":" + syn.dport;
         this.iss = (long) (Math.random() * 0xFFFFFF) + 0x100000L;
-        this.irs = syn.seq;
         this.rcvNxt = (syn.seq + syn.dataLen + (isSet(syn.flags, Bits.SYN) ? 1 : 0)) & 0xFFFFFFFFL;
         this.sndNxt = (this.iss + 1) & 0xFFFFFFFFL;
-        this.peerAcked = this.iss;                       // клиент ещё ничего не подтвердил
+        this.peerAcked = this.iss;                        // клиент ещё ничего не подтвердил
+        this.peerScale = Math.max(0, Math.min(14, syn.wscale));
+        // пока не пришло ни одного ACK, берём максимум, который клиент мог объявить
+        this.peerWindow = Math.min(16L << 20, 65535L << peerScale);
     }
 
     private static boolean isSet(int flags, int f) { return (flags & f) != 0; }
@@ -109,6 +122,28 @@ public final class TcpFlow {
         worker.start();
     }
 
+    private volatile int dlMss;
+
+    /**
+     * Размер сегмента: по умолчанию под текущий MTU туннеля (он подобран под реальный
+     * линк), а если в правиле задан mss — им режем ответы сервера. Байты не меняются,
+     * меняется нарезка: ровно то, для чего на ПК служит --dpi-desync-split-pos.
+     */
+    private int mss() {
+        int d = dlMss;
+        if (d >= 88) return d;
+        int m = ZapretService.MTU - (v6 ? 60 : 40);
+        return m < 536 ? 536 : m;
+    }
+
+    /** Какое окно объявляем клиенту (в сыром виде, он умножит на 1<<OUR_SCALE). */
+    private int advWindow() {
+        long avail;
+        synchronized (lock) { avail = MAX_QUEUE - queued; }
+        if (avail < 0) avail = 0;
+        return (int) Math.min(0xFFFFL, avail >> OUR_SCALE);
+    }
+
     // ---------------------------------------------------------------- приём из туннеля
 
     /** Вызывается из читающего потока туннеля. */
@@ -121,23 +156,25 @@ public final class TcpFlow {
             return;
         }
 
+        // повторный SYN (клиент не получил SYN-ACK) — повторяем свой SYN-ACK, иначе
+        // приложение упрётся в таймаут и закроет соединение с нашей стороны
+        if (isSet(p.flags, Bits.SYN) && !isSet(p.flags, Bits.ACK)) {
+            if (ready && System.currentTimeMillis() - lastSynAckAt > 400) sendSynAck();
+            return;
+        }
+
         // что клиент подтвердил и какое окно объявляет
         peerAcked = Window.advanceAcked(peerAcked, p.ackNum);
-        peerWindow = p.window;
-
-        // Чистый SYN: подтверждаем его SYN-ACK из рабочего потока, здесь молчим,
-        // иначе клиент получил бы ACK раньше, чем SYN-ACK.
-        if (isSet(p.flags, Bits.SYN) && p.dataLen == 0) return;
+        peerWindow = Math.min(16L << 20, (p.window & 0xFFFFL) << peerScale);
 
         if (p.dataLen > 0) {
             long seq = p.seq & 0xFFFFFFFFL;
             long end = (seq + p.dataLen) & 0xFFFFFFFFL;
-            int skip = 0;
-            int take = p.dataLen;
-            if (seqBefore(end, rcvNxt)) {
-                skip = p.dataLen;                       // целиком старые данные (ретрансмиссия)
-            } else if (seqBefore(seq, rcvNxt)) {
-                skip = (int) ((rcvNxt - seq) & 0xFFFFFFFFL);  // часть уже принята
+            int skip = 0, take = p.dataLen;
+            if (!Window.serialAfter(end, rcvNxt) && end != rcvNxt) {
+                skip = p.dataLen;                                   // целиком старые данные
+            } else if (!Window.serialAfter(seq, rcvNxt) && seq != rcvNxt) {
+                skip = (int) ((rcvNxt - seq) & 0xFFFFFFFFL);        // часть уже принята
                 take = p.dataLen - skip;
             }
             if (take > 0) {
@@ -159,30 +196,38 @@ public final class TcpFlow {
 
         if (isSet(p.flags, Bits.FIN)) clientDone = true;
 
-        // подтверждаем всё принятое; окно = сколько ещё готовы принять наверх
-        int advWindow = (int) Math.max(0, Math.min(0xFFFF, MAX_QUEUE - queued));
-        host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.ACK, advWindow, null, 0, 0, 0));
+        host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.ACK, advWindow(), null, 0, 0, 0));
 
         // возможно, клиент открыл окно — есть чем разблокировать отдачу
         synchronized (lock) { lock.notifyAll(); }
+    }
+
+    private void sendSynAck() {
+        lastSynAckAt = System.currentTimeMillis();
+        host.toTun(Bits.buildTcp(tmpl, iss, rcvNxt, Bits.SYN | Bits.ACK, advWindow(),
+                null, 0, 0, mss(), OUR_SCALE));
     }
 
     // ---------------------------------------------------------------- рабочий поток
 
     private void run() {
         try {
-            fd = Os.socket(v6 ? OsConstants.AF_INET6 : OsConstants.AF_INET,
-                    OsConstants.SOCK_STREAM, 0);
-            host.protectFd(fd);
-            Os.connect(fd, InetAddress.getByAddress(srvAddr), srvPort);
+            sock = new Socket();
+            // Каждый write() должен уйти сразу одним сегментом, иначе фрагментация
+            // ClientHello превратится в «ядро само соберёт как хочет».
+            try { sock.setTcpNoDelay(true); } catch (Exception ignored) { }
+            try { sock.setTrafficClass(0x10); } catch (Exception ignored) { }
+            try { sock.setSoTimeout(READ_WAIT_MS); } catch (Exception ignored) { }
+            // явный таймаут: иначе мёртвый адрес держит этот поток две минуты, а приложение
+            // в это время показывает «бесконечную загрузку»
+            sock.connect(new InetSocketAddress(InetAddress.getByAddress(srvAddr), srvPort),
+                    CONNECT_MS);
+            out = sock.getOutputStream();
+            in = sock.getInputStream();
             ready = true;
-            // SYN-ACK: MSS объявляем, чтобы клиент не слал сегменты больше нашего MTU
-            host.toTun(Bits.buildTcp(tmpl, iss, rcvNxt, Bits.SYN | Bits.ACK,
-                    (int) Math.min(0xFFFF, MAX_QUEUE), null, 0, 0, MSS));
+            sendSynAck();
             host.stats().log("TCP -> " + peer + " установлен");
 
-            StructPollfd pollfd = new StructPollfd();
-            pollfd.fd = fd;
             byte[] rbuf = new byte[16384];
 
             while (!stopped) {
@@ -199,49 +244,70 @@ public final class TcpFlow {
                         if (hostName != null && !peer.contains("(")) {
                             peer = peer + " (" + hostName + ")";
                         }
-                        Desync.sendFirst(fd, v6, Desync.serverAddress(srvAddr, srvPort),
+                        Desync.sendFirst(out, v6,
+                                Desync.serverAddress(srvAddr, srvPort),
                                 chunk, 0, chunk.length, rule, proto, host.stats(), peer);
                         firstSent = true;
+                        // mss из правила: с этого момента ответы сервера отдаём
+                        // более мелкими сегментами (тот же байтовый поток, другая нарезка)
+                        if (rule != null && rule.mss >= 88) {
+                            dlMss = rule.mss;
+                            host.stats().log("сегменты ответа: " + dlMss + " байт [" + rule.name + "]");
+                        }
                     } else {
-                        Desync.writeAll(fd, chunk, 0, chunk.length);
+                        out.write(chunk, 0, chunk.length);
+                        out.flush();
                     }
                     synchronized (lock) {
                         queue.pollFirst();
                         queued -= chunk.length;
+                        lock.notifyAll();
                     }
-                    continue;   // сразу к следующему куску, не дожидаясь poll
+                    continue;   // сразу к следующему куску, не дожидаясь чтения
                 }
 
                 if (clientDone && queued == 0 && !eofFromServer) {
-                    try { Os.shutdown(fd, OsConstants.SHUT_WR); } catch (Exception ignored) { }
+                    try { sock.shutdownOutput(); } catch (Exception ignored) { }
                     clientDone = false;
                 }
 
-                // 2) отдать клиенту то, что уже прочитано от сервера и ждёт своего окна
+                // 2) отдать клиенту то, что уже прочитано и ждёт своего окна
                 pump();
 
                 // 3) почитать сервера, если есть куда складывать
                 boolean room;
                 synchronized (lock) { room = outQueued < MAX_OUT; }
-                pollfd.events = (short) (room ? OsConstants.POLLIN : 0);
-                int pr = Os.poll(new StructPollfd[]{pollfd}, 200);
-                if (pr > 0 && (pollfd.revents & (OsConstants.POLLIN | OsConstants.POLLHUP)) != 0 && room) {
-                    int n = Os.read(fd, rbuf, 0, Math.min(rbuf.length, MSS * 4));
-                    if (n <= 0) {
+                if (room) {
+                    int n;
+                    try {
+                        n = in.read(rbuf, 0, Math.min(rbuf.length, mss() * 12));
+                    } catch (SocketTimeoutException te) {
+                        n = -2;                     // просто тихо, не обрыв
+                    }
+                    if (n > 0) {
+                        enqueueOut(rbuf, 0, n);
+                        lastActivity = System.currentTimeMillis();
+                        continue;
+                    }
+                    if (n == 0) {
+                        // ноль не бывает у InputStream.read(len>0), но на всякий случай
+                    } else if (n == -1) {
                         eofFromServer = true;
-                        pump();          // сначала доотдаём накопленное
+                        pump();
                         host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.FIN | Bits.ACK,
-                                (int) Math.min(0xFFFF, peerWindow), null, 0, 0, 0));
+                                advWindow(), null, 0, 0, 0));
                         break;
                     }
-                    enqueueOut(rbuf, 0, n);
-                    continue;
                 }
 
-                // 4) ничего не происходит: ждём либо данных, либо ACK (окна), либо таймаута
+                // 4) ничего не происходит: ждём либо данные, либо ACK (окно), либо таймаут
                 if (hasPendingWork()) {
                     synchronized (lock) {
                         try { lock.wait(100); } catch (InterruptedException ignored) { }
+                    }
+                } else {
+                    synchronized (lock) {
+                        try { lock.wait(200); } catch (InterruptedException ignored) { }
                     }
                 }
 
@@ -256,15 +322,33 @@ public final class TcpFlow {
             }
         } catch (Exception e) {
             if (!stopped) {
-                host.stats().log("ошибка TCP " + peer + ": " + e);
-                Log.d(TAG, "flow error", e);
-                try {
-                    host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.RST, 0, null, 0, 0, 0));
-                } catch (Exception ignored) { }
+                if (ready) {
+                    // соединение жило — обрыв пришёл от сервера. Закрываем аккуратно FINом,
+                    // чтобы приложение не показало «соединение сброшено» на ровном месте.
+                    host.stats().log("сервер оборвал " + peer + ": " + reason(e));
+                    try {
+                        host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.FIN | Bits.ACK,
+                                advWindow(), null, 0, 0, 0));
+                    } catch (Exception ignored) { }
+                } else {
+                    host.stats().log("нет связи с " + peer + ": " + reason(e));
+                    Log.d(TAG, "connect failed", e);
+                    try {
+                        host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.RST, 0, null, 0, 0, 0));
+                    } catch (Exception ignored) { }
+                }
             }
         } finally {
             close(false);
         }
+    }
+
+    private static String reason(Exception e) {
+        String m = e.getMessage();
+        if (m == null || m.isEmpty()) m = e.getClass().getSimpleName();
+        Throwable c = e.getCause();
+        if (c != null && c.getMessage() != null && !c.getMessage().isEmpty()) m += " <- " + c.getMessage();
+        return m;
     }
 
     private boolean hasPendingWork() {
@@ -275,10 +359,11 @@ public final class TcpFlow {
 
     /** Кладём ответ сервера в очередь «вниз» кусками по MSS. */
     private void enqueueOut(byte[] buf, int off, int len) {
+        int m = mss();
         int pos = off, end = off + len;
         synchronized (lock) {
             while (pos < end) {
-                int n = Math.min(MSS, end - pos);
+                int n = Math.min(m, end - pos);
                 byte[] piece = Bits.slice(buf, pos, n);
                 outQueue.add(new Piece(piece, 0));
                 outQueued += n;
@@ -293,6 +378,7 @@ public final class TcpFlow {
      * Если окно закрыто — запоминаем момент, чтобы не висеть вечно.
      */
     private void pump() {
+        int m = mss();
         while (!stopped) {
             Piece head;
             synchronized (lock) { head = outQueue.peekFirst(); }
@@ -300,14 +386,13 @@ public final class TcpFlow {
                 blockedSince = 0;
                 return;
             }
-            long free = Window.allowed(sndNxt, peerAcked, (int) peerWindow);
+            long free = Window.allowed(sndNxt, peerAcked, peerWindow);
             if (free <= 0) {
                 if (blockedSince == 0) blockedSince = System.currentTimeMillis();
                 return;
             }
             int n = (int) Math.min(head.left(), free);
-            int advWindow = (int) Math.max(0, Math.min(0xFFFF, MAX_QUEUE - queued));
-            host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.ACK | Bits.PSH, advWindow,
+            host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.ACK | Bits.PSH, advWindow(),
                     head.b, head.off, n, 0));
             head.off += n;
             sndNxt = (sndNxt + n) & 0xFFFFFFFFL;
@@ -322,19 +407,14 @@ public final class TcpFlow {
         }
     }
 
-    /** Сравнение номеров последовательности по модулю 2^32. */
-    private static boolean seqBefore(long a, long b) {
-        return !Window.serialAfter(a, b) && a != b;
-    }
-
     public void close(boolean hard) {
         if (stopped) return;
         stopped = true;
         closedAt = System.currentTimeMillis();
         synchronized (lock) { lock.notifyAll(); }
-        if (fd != null) {
-            try { Os.close(fd); } catch (Exception ignored) { }
-            fd = null;
+        if (sock != null) {
+            try { sock.close(); } catch (IOException ignored) { }
+            sock = null;
         }
         // Из таблицы потоков нас убирает сервис: ему нужен closedAt, чтобы не
         // обрывать запоздалые ACK/FIN клиента через RST.

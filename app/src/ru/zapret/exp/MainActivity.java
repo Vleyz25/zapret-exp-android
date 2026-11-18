@@ -176,8 +176,9 @@ public class MainActivity extends Activity {
         if (s == null) return;
         statsText.setText(String.format(getString(R.string.stats_format),
                 s.tcpFlows.get(), s.udpFlows.get(), s.desyncTls.get(), s.desyncHttp.get(),
-                s.desyncQuic.get(), profile.domainCount(),
-                Bits.human(s.bytesDown.get()), Bits.human(s.bytesUp.get())));
+                s.desyncQuic.get(), s.dnsLearned.get(), s.dnsCached.get(),
+                profile.domainCount(), Bits.human(s.bytesDown.get()),
+                Bits.human(s.bytesUp.get())));
         showLog(s);
     }
 

@@ -16,6 +16,7 @@ public final class Stats {
     public final AtomicLong bytesDown = new AtomicLong();
     public final AtomicLong bytesUp = new AtomicLong();
     public final AtomicLong dnsLearned = new AtomicLong();
+    public final AtomicLong dnsCached = new AtomicLong();
     public final AtomicLong dropped = new AtomicLong();
 
     private final ArrayDeque<String> log = new ArrayDeque<>();
@@ -37,7 +38,7 @@ public final class Stats {
     public void reset() {
         tcpFlows.set(0); udpFlows.set(0);
         desyncTls.set(0); desyncHttp.set(0); desyncQuic.set(0);
-        bytesDown.set(0); bytesUp.set(0); dnsLearned.set(0); dropped.set(0);
+        bytesDown.set(0); bytesUp.set(0); dnsLearned.set(0); dnsCached.set(0); dropped.set(0);
         synchronized (log) { log.clear(); }
     }
 }

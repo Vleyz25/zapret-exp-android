@@ -39,6 +39,7 @@ public class CoreTest {
         testHttpHost();
         testDns();
         testSplits();
+        testTcpOptions();
         testWindow();
         testShippedConfig(pc);
 
@@ -211,6 +212,35 @@ public class CoreTest {
         check("splits: инвариант покрытия выполнен для len 1..1500", true, "");
     }
 
+    // ---- 7a. опции TCP: window scaling (без него потолок ~1 МБ/с) ----
+    static void testTcpOptions() throws Exception {
+        Bits.Pkt cli = new Bits.Pkt();
+        cli.family = Bits.V4;
+        cli.proto = Bits.IPPROTO_TCP;
+        cli.src = new byte[]{10, 71, 71, 2};
+        cli.dst = new byte[]{93, (byte) 184, (byte) 216, 34};
+        cli.sport = 45123;
+        cli.dport = 443;
+        byte[] syn = Bits.buildTcp(cli, 1000, 0, Bits.SYN, 65535, null, 0, 0, 1360, 7);
+        Bits.Pkt back = Bits.parse(syn, syn.length);
+        check("opts: SYN с MSS и wscale разобран", back != null, "");
+        eq("opts: window scale прочитан из SYN", back.wscale, 7);
+        eq("opts: MSS дошёл", Bits.u16(syn, 20 + 20 + 2), 1360);
+        // без опций scale не должно быть
+        byte[] plain = Bits.buildTcp(cli, 1000, 0, Bits.ACK, 100, null, 0, 0, 0);
+        eq("opts: пакет без опций -> scale 0", Bits.parse(plain, plain.length).wscale, 0);
+        // заголовок кратен 4 и не съедает данные
+        String crlf = "" + (char) 13 + (char) 10;
+        String req = "GET / HTTP/1.1" + crlf + "Host: example.com" + crlf + crlf;
+        byte[] data = req.getBytes("UTF-8");
+        byte[] withOpts = Bits.buildTcp(cli, 1001, 1, Bits.PSH | Bits.ACK, 65535,
+                data, 0, data.length, 1360, 4);
+        Bits.Pkt p2 = Bits.parse(withOpts, withOpts.length);
+        eq("opts: данные не сдвинуты", p2.dataLen, data.length);
+        eq("opts: payload дошёл целиком",
+                new String(p2.buf, p2.dataOff, p2.dataLen, "UTF-8"), req);
+    }
+
     // ---- 7b. управление окном отдачи (без него клиент «зависает» без видео) ----
     static void testWindow() {
         eq("window: при окне 0 отправить нельзя", Window.allowed(1001, 1000, 0), 0L);
@@ -225,6 +255,9 @@ public class CoreTest {
         eq("window: allowed через границу 2^32", Window.allowed(0x100L, near, 0x300), 0x100L);
         eq("window: старый ACK игнорируется", Window.advanceAcked(1500, 1400), 1500L);
         eq("window: новый ACK принят", Window.advanceAcked(1500, 1600), 1600L);
+        // масштабированное окно: 65535 << 7 = 8 МБ, а не 64 КБ
+        eq("window: scale=7 даёт 8 МБ окна", Window.allowed(1001, 1000, 65535L << 7), (65535L << 7) - 1);
+        eq("window: большое inflight внутри большого окна", Window.allowed(1L << 20, 0L, 4L << 20), 3L << 20);
     }
 
     // ---- 8. конфигурация, которая реально лежит в APK ----

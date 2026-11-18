@@ -129,6 +129,27 @@ public final class Hello {
      * недоступен (Initial зашифрован) — zapret на ПК в таких случаях опирается на
      * ipset, мы опираемся на сопоставление «домен -> IP» из собственных ответов DNS.
      */
+    /**
+     * Ключ DNS-вопроса: имя + тип + класс. ID в ключ не входит, потому что он у каждого
+     * запроса свой — при ответе из кэша мы подставляем ID обратно.
+     */
+    public static String dnsQuestionKey(byte[] b, int off, int len) {
+        if (len - off < 12) return null;
+        int i = off + 12;
+        while (i < off + len) {
+            int l = b[i] & 0xFF;
+            if (l == 0) { i++; break; }
+            if ((l & 0xC0) != 0) return null;         // сжатие имени в запросе не встречается
+            i += l + 1;
+        }
+        if (i + 4 > off + len) return null;
+        int type = ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF);
+        int cls = ((b[i + 2] & 0xFF) << 8) | (b[i + 3] & 0xFF);
+        String name = dnsQueryName(b, off, len);
+        if (name == null) return null;
+        return name.toLowerCase() + '|' + type + '|' + cls;
+    }
+
     public static List<byte[]> dnsAnswerAddresses(byte[] b, int off, int len) {
         List<byte[]> addrs = new ArrayList<>();
         try {

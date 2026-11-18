@@ -6,8 +6,10 @@ import android.system.OsConstants;
 import android.util.Log;
 
 import java.io.FileDescriptor;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.ArrayDeque;
 
 /**
  * Приёмы десинхронизации DPI на уровне сокета.
@@ -19,14 +21,14 @@ import java.net.InetSocketAddress;
  *                                              TTL, чтобы не трогать последовательность
  *                                              настоящего потока (см. ниже про rootless)
  *   --dpi-desync=fake (QUIC/UDP)            -> дополнительные датаграммы с малым TTL:
- *                                              датаграммы независимы, поэтому это точный
+ *                                              датаграммы независимые, поэтому это точный
  *                                              перенос приёма, без оговорок
  *   --dpi-desync-fooling=ts                 -> роль «не долететь до сервера» выполняет TTL
  *
  * Почему иначе, чем winws на ПК: Android без root не позволяет задать номер
  * последовательности, TCP Timestamp или вставить байты в чужой поток — этим на ПК
  * занимается WinDivert. Вставлять фейк в тот же сокет нельзя: сервер получил бы мусор
- * вместо начала ClientHello и TLS бы развалился. Поэтому на TCP применяются только
+ * вместо начала ClientHello, и TLS бы развалился. Поэтому на TCP применяются только
  * сохраняющие поток приёмы (фрагментация), а фейки уходят отдельными потоками/датаграммами.
  */
 public final class Desync {
@@ -42,40 +44,42 @@ public final class Desync {
     private static final int TCP_NODELAY = 1;
     private static final int TCP_MAXSEG = 2;
 
+    /**
+     * Очередь фейковых TCP-соединений. Её нельзя держать в самом потоке: фейк — это
+     * отдельный handshake (SYN, ACK, отправка), то есть +1 RTT к каждой новой связи, и
+     * именно поэтому «интернет тормозит» при включённом приложении. Один фоновый поток
+     * делает это параллельно с настоящим соединением.
+     */
+    private static final ArrayDeque<Object[]> fakeQueue = new ArrayDeque<>();
+    private static final Object fakeLock = new Object();
+    private static final int FAKE_QUEUE_MAX = 16;
+
     private Desync() { }
 
     /**
      * Отправка первого запроса TCP-потока с десинхронизацией.
      * Байты оригинала уходят целиком и в том же порядке — поток не портится.
+     *
+     * @param out поток уже подключённого сокета «мы -> сервер»
+     * @param fd  файловый дескриптор того же сокета (нужен для TCP_MAXSEG)
      */
-    public static int sendFirst(FileDescriptor fd, boolean v6, InetSocketAddress server,
+    public static int sendFirst(OutputStream out, boolean v6,
+                               InetSocketAddress server,
                                byte[] payload, int off, int len,
                                Config.Rule r, String appProto, Stats stats, String peer) {
-        try {
-            Os.setsockoptInt(fd, IPPROTO_TCP_LEVEL, TCP_NODELAY, 1);
-        } catch (ErrnoException e) {
-            Log.d(TAG, "TCP_NODELAY: " + e);
-        }
-        // Дополнительный рычаг: уменьшить MSS, чтобы ClientHello шёл ещё более
-        // мелкими сегментами. Байты не меняются, поток остаётся валидным.
-        if (r != null && r.mss >= 88) {
-            try {
-                Os.setsockoptInt(fd, IPPROTO_TCP_LEVEL, TCP_MAXSEG, r.mss);
-                stats.desyncTls.incrementAndGet();
-            } catch (ErrnoException e) {
-                Log.d(TAG, "TCP_MAXSEG: " + e);
-            }
-        }
-
+        // TCP_NODELAY и размеры сегментов выставляет владелец сокета (TcpFlow):
+        // публичный API Android не даёт взять файловый дескриптор у Socket, поэтому
+        // ядро настраивается методами Socket, а не через setsockopt.
         try {
             if (r == null) {
-                writeAll(fd, payload, off, len);
+                writeAll(out, payload, off, len);
                 return len;
             }
 
-            // 1) фейк: отдельное соединение с малым TTL (не трогает наш поток)
+            // 1) фейк: отдельное соединение с малым TTL, в фоне — он не должен
+            //    задерживать настоящий handshake
             if (r.fake != null && r.fake.length > 0 && server != null) {
-                fakeConnection(v6, server, r, stats, peer);
+                scheduleFake(v6, server, r, stats, peer);
             }
 
             // 2) оригинал: фрагментируем по позициям из правила (тот же байтовый поток)
@@ -83,10 +87,10 @@ public final class Desync {
             int prev = 0;
             for (int c : cuts) {
                 if (c <= prev || c >= len) continue;
-                writeAll(fd, payload, off + prev, c - prev);
+                writeAll(out, payload, off + prev, c - prev);
                 prev = c;
             }
-            writeAll(fd, payload, off + prev, len - prev);
+            if (len - prev > 0) writeAll(out, payload, off + prev, len - prev);
 
             if ("tls".equals(appProto)) stats.desyncTls.incrementAndGet();
             else if ("http".equals(appProto)) stats.desyncHttp.incrementAndGet();
@@ -95,16 +99,61 @@ public final class Desync {
             return len;
         } catch (Exception e) {
             Log.w(TAG, "десинк не применён, отправляю целиком", e);
+            stats.log("десинк [" + (r == null ? "?" : r.name) + "] не применён: "
+                    + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
             try {
-                writeAll(fd, payload, off, len);
+                writeAll(out, payload, off, len);
             } catch (Exception ignored) { }
             return len;
         }
     }
 
+    private static void scheduleFake(boolean v6, InetSocketAddress server, Config.Rule r,
+                                     Stats stats, String peer) {
+        Object[] job = new Object[]{Boolean.valueOf(v6), server, r, stats, peer};
+        synchronized (fakeLock) {
+            if (fakeQueue.size() >= FAKE_QUEUE_MAX) fakeQueue.pollFirst();
+            fakeQueue.add(job);
+            if (fakeWorker == null) {
+                fakeWorker = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        fakeLoop();
+                    }
+                }, "desync-fake");
+                fakeWorker.setDaemon(true);
+                fakeWorker.start();
+            }
+            fakeLock.notifyAll();
+        }
+    }
+
+    private static Thread fakeWorker;
+
+    private static void fakeLoop() {
+        while (!Thread.currentThread().isInterrupted()) {
+            Object[] job;
+            synchronized (fakeLock) {
+                while ((job = fakeQueue.pollFirst()) == null) {
+                    try {
+                        fakeLock.wait();
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+            try {
+                fakeConnection((Boolean) job[0], (InetSocketAddress) job[1],
+                        (Config.Rule) job[2], (Stats) job[3], (String) job[4]);
+            } catch (Exception e) {
+                Log.d(TAG, "fake в фоне не удался: " + e);
+            }
+        }
+    }
+
     /**
      * Фейковый ClientHello отдельным TCP-соединением с малым TTL.
-     * Инспекция трафика видит его, а сервер — нет (пакеты умирают в пути).
+     * Инспекция трафика его видит, а сервер — нет (пакеты умирают в пути).
      */
     public static void fakeConnection(boolean v6, InetSocketAddress server, Config.Rule r,
                                       Stats stats, String peer) {
@@ -121,6 +170,7 @@ public final class Desync {
             stats.log("fake-соединение [" + r.name + "] " + r.fakeName + " x" + r.repeat
                     + " ttl=" + r.ttl + " -> " + peer);
         } catch (Exception e) {
+            // Не ошибка приложения: фейк мог и не дойти до сервера — в этом весь смысл.
             Log.d(TAG, "fake-соединение не удалось: " + e);
         } finally {
             if (fd != null) {
@@ -130,7 +180,7 @@ public final class Desync {
     }
 
     /**
-     * фейковые QUIC/UDP-датаграммы перед оригиналом. Отдельные датаграммы не влияют
+     * Фейковые QUIC/UDP-датаграммы перед оригиналом. Отдельные датаграммы не влияют
      * на «поток», так что это прямой перенос --dpi-desync=fake для UDP из general (EXP).
      */
     public static void udpFakes(boolean v6, java.net.SocketAddress dst, byte[] data, int off, int len,
@@ -160,6 +210,13 @@ public final class Desync {
     private static void setHop(FileDescriptor fd, boolean v6, int ttl) throws Exception {
         if (v6) Os.setsockoptInt(fd, IPPROTO_IPV6_LEVEL, IPV6_UNICAST_HOPS, ttl);
         else Os.setsockoptInt(fd, IPPROTO_IP_LEVEL, IP_TTL, ttl);
+    }
+
+    /** Пишем до конца (поток блокирующий). */
+    public static void writeAll(OutputStream out, byte[] b, int off, int len) throws Exception {
+        if (len <= 0) return;
+        out.write(b, off, len);
+        out.flush();
     }
 
     /** Пишем до конца (сокет блокирующий). */

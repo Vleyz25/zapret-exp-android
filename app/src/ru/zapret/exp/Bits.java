@@ -38,6 +38,8 @@ public final class Bits {
         // только для TCP
         public long seq, ackNum;
         public int flags, window, headerLen;
+        /** Window scaling (RFC 7323) из опций SYN: 0 = опции нет, 14 = максимум. */
+        public int wscale;
     }
 
     private Bits() { }
@@ -120,6 +122,7 @@ public final class Bits {
             p.window = u16(buf, l4Start + 14);
             p.dataOff = l4Start + p.headerLen;
             p.dataLen = Math.max(0, l4End - p.dataOff);
+            p.wscale = tcpWindowScale(buf, l4Start, p.headerLen);
         } else if (p.proto == IPPROTO_UDP) {
             if (l4Start + 8 > l4End) return null;
             p.sport = u16(buf, l4Start);
@@ -130,6 +133,22 @@ public final class Bits {
             p.dataLen = Math.max(0, Math.min(l4Start + ul, l4End) - p.dataOff);
         }
         return p;
+    }
+
+    /** Обход TCP-опций: вернуть величину window scaling из опции kind=3. */
+    public static int tcpWindowScale(byte[] buf, int l4Start, int headerLen) {
+        int i = l4Start + 20, end = l4Start + headerLen;
+        while (i < end) {
+            int kind = u8(buf, i);
+            if (kind == 0) break;                        // End of options
+            if (kind == 1) { i++; continue; }             // NOP
+            if (i + 1 >= end) break;
+            int len = u8(buf, i + 1);
+            if (len < 2) break;                           // мусор, дальше не идём
+            if (kind == 3 && len == 3) return Math.min(14, u8(buf, i + 2));
+            i += len;
+        }
+        return 0;
     }
 
     /** Контрольная сумма RFC 1071 поверх seed. */
@@ -187,8 +206,22 @@ public final class Bits {
      */
     public static byte[] buildTcp(Pkt in, long seq, long ack, int flags, int window,
                                   byte[] payload, int pOff, int pLen, int mss) {
+        return buildTcp(in, seq, ack, flags, window, payload, pOff, pLen, mss, -1);
+    }
+
+    /**
+     * wscale >= 0 добавляет опцию Window Scaling: наше объявленное окно клиент будет
+     * понимать как window &lt;&lt; wscale. Без этого приёма потолок приёма — 65535 байт,
+     * то есть примерно 1 МБ/с на мобильном RTT, и скорость интернета упирается в нас.
+     */
+    public static byte[] buildTcp(Pkt in, long seq, long ack, int flags, int window,
+                                  byte[] payload, int pOff, int pLen, int mss, int wscale) {
         int ihl = ipHeaderLen(in.family);
-        int tcpLen = mss > 0 ? 24 : 20;
+        int opt = 0;
+        if (mss > 0) opt += 4;
+        if (wscale >= 0) opt += 3;
+        if (opt > 0) opt = (opt + 3) & ~3;                // выровнять до 4 байт (NOP/EOL)
+        int tcpLen = 20 + opt;
         if (payload == null) pLen = 0;
         int total = ihl + tcpLen + pLen;
         byte[] b = new byte[total];
@@ -219,11 +252,21 @@ public final class Bits {
         b[t + 12] = (byte) ((tcpLen / 4) << 4);
         b[t + 13] = (byte) flags;
         put16(b, t + 14, window & 0xFFFF);
+        int o = t + 20;
         if (mss > 0) {
-            b[t + 20] = 2;
-            b[t + 21] = 4;
-            put16(b, t + 22, mss);
+            b[o] = 2;
+            b[o + 1] = 4;
+            put16(b, o + 2, mss);
+            o += 4;
         }
+        if (wscale >= 0) {
+            b[o] = 3;
+            b[o + 1] = 3;
+            b[o + 2] = (byte) wscale;
+            o += 3;
+        }
+        while (o < t + tcpLen - 1) b[o++] = 1;            // NOP
+        if (o < t + tcpLen) b[o] = 0;                      // End of options
         if (pLen > 0) System.arraycopy(payload, pOff, b, t + tcpLen, pLen);
 
         int l4Len = tcpLen + pLen;

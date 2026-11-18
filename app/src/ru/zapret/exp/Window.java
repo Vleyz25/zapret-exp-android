@@ -20,9 +20,13 @@ public final class Window {
         return (sndNxt - peerAcked) & 0xFFFFFFFFL;
     }
 
-    /** Сколько байт можно отправить сейчас. */
-    public static long allowed(long sndNxt, long peerAcked, int peerWindow) {
-        long w = peerWindow & 0xFFFFL;
+    /**
+     * Сколько байт можно отправить сейчас. window передаётся уже масштабированным:
+     * сырое поле окна из заголовка умножается на 1&lt;&lt;scale (RFC 7323), иначе потолок
+     * — 65535 байт на круг, около 1 МБ/с на мобильном RTT.
+     */
+    public static long allowed(long sndNxt, long peerAcked, long window) {
+        long w = window < 0 ? 0 : window;
         long used = inflight(sndNxt, peerAcked);
         long free = w - used;
         return free < 0 ? 0 : free;

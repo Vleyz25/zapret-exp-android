@@ -4,7 +4,11 @@
     <string name="switch_on">Запрет включён</string>
     <string name="switch_off">Выключено</string>
     <string name="need_permission">Система спрашивает разрешение на создание VPN-соединения — нажми «Разрешить».</string>
-    <string name="stats_format">TCP-потоки: %1$d   UDP-потоки: %2$d\nДесинк применён: TLS %3$d, HTTP %4$d, QUIC/UDP %5$d\nСписки: %6$d доменов\nТрафик: ↓ %7$s  ↑ %8$s</string>
+    <string name="stats_format">TCP-потоки: %1$d   UDP-потоки: %2$d
+Десинк применён: TLS %3$d, HTTP %4$d, QUIC/UDP %5$d
+DNS: ответов %6$d, из кэша %7$d
+Списки: %8$d доменов
+Трафик: ↓ %9$s  ↑ %10$s</string>
     <string name="profile_name">Профиль: general (EXP), перенос стратегии с ПК</string>
     <string name="notif_running">Запрет активен</string>
     <string name="notif_idle">Запрет выключен</string>

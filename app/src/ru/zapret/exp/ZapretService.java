@@ -46,7 +46,8 @@ public class ZapretService extends VpnService
     private static final String TUN_DNS_V4 = "10.71.71.1";
     private static final String TUN_IP_V6 = "fd71:71::2";
     private static final String TUN_DNS_V6 = "fd71:71::1";
-    private static final int MTU = 1400;
+    /** MTU туннеля: подбирается под реальный линк (LTE часто 1420, а не 1500). */
+    public static volatile int MTU = 1400;
     private static final int NOTIF_ID = 1;
     private static final String CHANNEL = "tunel";
 
@@ -213,6 +214,7 @@ public class ZapretService extends VpnService
 
     /** ownDns=false — приложения резолвятся системными серверами, запросы всё равно идут через туннель. */
     private boolean buildTunnel(boolean ipv6, boolean ownDns) throws Exception {
+            MTU = discoverMtu();
             Builder b = new Builder();
             b.setSession("Запрет (EXP)");
             b.addAddress(TUN_IP_V4, 32);
@@ -246,6 +248,28 @@ public class ZapretService extends VpnService
         reader.setDaemon(true);
         reader.start();
         return true;
+    }
+
+    /**
+     * MTU туннеля = MTU линка минус запас на заголовки. Если поставить 1400 на линке с
+     * MTU 1420 (типично для LTE), наши сегменты будут фрагментироваться или теряться —
+     * вот откуда «работает плохо, но включилось».
+     */
+    private int discoverMtu() {
+        int link = 0;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            Network net = cm.getActiveNetwork();
+            if (net != null) {
+                LinkProperties lp = cm.getLinkProperties(net);
+                if (lp != null) link = lp.getMtu();
+            }
+        } catch (Exception ignored) { }
+        int chosen = link >= 1280 ? link - 60 : 1400;
+        if (chosen > 1400) chosen = 1400;
+        if (chosen < 1280) chosen = 1280;
+        stats.log("MTU линка " + (link > 0 ? link : "неизвестен") + " -> MTU туннеля " + chosen);
+        return chosen;
     }
 
     /** Наш собственный трафик не должен попадать в туннель (иначе кольцо). */
@@ -321,7 +345,10 @@ public class ZapretService extends VpnService
             if (tcpFlows.size() > 400) {
                 // подчищаем завершённые потоки, иначе таблица разрастается
                 for (Map.Entry<String, TcpFlow> e : new ArrayList<>(tcpFlows.entrySet())) {
-                    if (e.getValue().isStopped()) tcpFlows.remove(e.getKey());
+                    if (e.getValue().isStopped()) {
+                        tcpFlows.remove(e.getKey());
+                        stats.tcpFlows.decrementAndGet();
+                    }
                 }
             }
             if (tcpFlows.size() > 512) {
@@ -338,10 +365,24 @@ public class ZapretService extends VpnService
             return;
         }
         if (flow.isStopped()) {
+            // Android переиспользует локальные порты: новый SYN с тем же 4-кортежом —
+            // это НОВОЕ соединение, а не хвост старого. Раньше он попадал в «терпение»
+            // и молча терялся, приложение ретранслило SYN и в итоге получало RST.
+            if (syn) {
+                tcpFlows.remove(key);
+                stats.tcpFlows.decrementAndGet();
+                flow = new TcpFlow(this, p, key);
+                tcpFlows.put(key, flow);
+                stats.tcpFlows.incrementAndGet();
+                flow.start();
+                flow.onClientPacket(p);
+                return;
+            }
             // соединение уже закрыто, но клиент ещё досылает ACK/FIN — молча терпим,
             // иначе приложения увидят обрыв там, где всё закончилось нормально
             if (System.currentTimeMillis() - flow.closedAt() < TcpFlow.GRACE_MS) return;
             tcpFlows.remove(key);
+            stats.tcpFlows.decrementAndGet();
             try {
                 toTun(Bits.buildTcp(p, p.ackNum, 0, Bits.RST | Bits.ACK, 0, null, 0, 0, 0));
             } catch (Exception ignored) { }
@@ -504,6 +545,8 @@ public class ZapretService extends VpnService
         for (UdpFlow f : new ArrayList<>(udpFlows.values())) f.stop();
         tcpFlows.clear();
         udpFlows.clear();
+        stats.tcpFlows.set(0);
+        stats.udpFlows.set(0);
         if (tun != null) {
             try { tun.close(); } catch (Exception ignored) { }
             tun = null;
