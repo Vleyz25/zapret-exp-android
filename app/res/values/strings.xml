@@ -8,5 +8,6 @@
     <string name="profile_name">Профиль: general (EXP), перенос стратегии с ПК</string>
     <string name="notif_running">Запрет активен</string>
     <string name="notif_idle">Запрет выключен</string>
+    <string name="notif_stop">Выключить запрет</string>
     <string name="channel_name">Туннель</string>
 </resources>

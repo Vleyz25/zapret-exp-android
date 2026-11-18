@@ -422,6 +422,9 @@ public class ZapretService extends VpnService
         running = false;
         liveStats = stats;
         if (ticker != null) ticker.removeCallbacksAndMessages(null);
+        // уведомление могло быть нажато, пока экран открыт: обновить тумблер
+        try { sendBroadcast(new Intent(ACTION_TICK).setPackage(getPackageName())); }
+        catch (Exception ignored) { }
         for (TcpFlow f : new ArrayList<>(tcpFlows.values())) f.close(true);
         for (UdpFlow f : new ArrayList<>(udpFlows.values())) f.stop();
         tcpFlows.clear();
@@ -455,10 +458,17 @@ public class ZapretService extends VpnService
         Notification.Builder nb = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL)
                 : new Notification.Builder(this);
+        // Кнопка «Выключить» прямо в уведомлении — как stop-кнопка в трее на ПК,
+        // чтобы не искать иконку приложения.
+        Intent si = new Intent(this, ZapretService.class).setAction(ACTION_STOP);
+        PendingIntent stopPi = PendingIntent.getService(this, 1, si,
+                PendingIntent.FLAG_IMMUTABLE);
         Notification n = nb.setContentTitle(getString(R.string.app_name))
                 .setContentText(getString(R.string.notif_running))
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentIntent(pi)
+                .addAction(new Notification.Action.Builder(android.R.drawable.ic_lock_power_off,
+                        getString(R.string.notif_stop), stopPi).build())
                 .setOngoing(true)
                 .build();
         if (Build.VERSION.SDK_INT >= 29) {
