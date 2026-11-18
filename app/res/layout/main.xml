@@ -21,6 +21,13 @@
         android:textSize="16sp"
         android:text="Запрет YouTube и Discord" />
 
+    <Button
+        android:id="@+id/test_button"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:text="@string/test_button" />
+
     <TextView
         android:id="@+id/profile_text"
         android:layout_width="match_parent"

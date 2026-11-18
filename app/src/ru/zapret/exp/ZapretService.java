@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
+import android.util.Log;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
@@ -20,7 +21,6 @@ import android.os.Process;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
-import android.util.Log;
 
 import java.io.FileDescriptor;
 import java.net.InetAddress;
@@ -47,13 +47,8 @@ public class ZapretService extends VpnService
     private static final String TUN_DNS_V4 = "10.71.71.1";
     private static final String TUN_IP_V6 = "fd71:71::2";
     private static final String TUN_DNS_V6 = "fd71:71::1";
-    /** MTU туннеля: подбирается под реальный линк (LTE часто 1420, а не 1500). */
-    public static volatile int MTU = 1400;
-    /**
-     * Есть ли у оператора IPv6-канал. Без него туннель с маршрутом ::/0 — ловушка:
-     * приложение получает AAAA, видит «IPv6 работает» и уходит туда, куда хода нет.
-     */
-    public static volatile boolean IPV6_UP = true;
+
+
     private static final int NOTIF_ID = 1;
     private static final String CHANNEL = "tunel";
 
@@ -192,11 +187,11 @@ public class ZapretService extends VpnService
      * набора к минимальному и пишем в журнал, какой сработал.
      */
     private boolean openTunel() {
-        MTU = discoverMtu();
-        IPV6_UP = discoverIpv6();
+        Net.MTU = discoverMtu();
+        Net.IPV6_UP = discoverIpv6();
         // Если IPv6-канала нет, варианты с маршрутом ::/0 даже не пробуем: это не
         // «запасной путь», а источник сломанных соединений.
-        int[] order = IPV6_UP ? new int[]{0, 1, 2} : new int[]{2};
+        int[] order = Net.IPV6_UP ? new int[]{0, 1, 2} : new int[]{2};
         String[] names = {"v4+v6, свой DNS", "v4+v6, системный DNS", "только v4"};
         String[] tried = new String[order.length];
         Exception[] errs = new Exception[order.length];
@@ -238,7 +233,7 @@ public class ZapretService extends VpnService
                 b.addDnsServer(TUN_DNS_V4);
                 if (ipv6) b.addDnsServer(TUN_DNS_V6);
             }
-            b.setMtu(MTU);
+            b.setMtu(Net.MTU);
             // Чтение из туннеля должно блокироваться, а не возвращать EAGAIN.
             // setBlocking появился в API 30, на более старых дефолт и так приемлемый.
             try {
@@ -324,7 +319,7 @@ public class ZapretService extends VpnService
     }
 
     private void readLoop() {
-        byte[] buf = new byte[MTU * 4];
+        byte[] buf = new byte[Net.MTU * 4];
         FileDescriptor fd = tun.getFileDescriptor();
         while (!stopRequested) {
             int n;

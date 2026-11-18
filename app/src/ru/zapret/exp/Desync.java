@@ -1,9 +1,7 @@
 package ru.zapret.exp;
 
-import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
-import android.util.Log;
 
 import java.io.FileDescriptor;
 import java.io.OutputStream;
@@ -98,7 +96,7 @@ public final class Desync {
                     + " фрагменты=" + java.util.Arrays.toString(cuts));
             return len;
         } catch (Exception e) {
-            Log.w(TAG, "десинк не применён, отправляю целиком", e);
+            log(TAG, "десинк не применён, отправляю целиком: " + e);
             stats.log("десинк [" + (r == null ? "?" : r.name) + "] не применён: "
                     + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
             try {
@@ -146,7 +144,7 @@ public final class Desync {
                 fakeConnection((Boolean) job[0], (InetSocketAddress) job[1],
                         (Config.Rule) job[2], (Stats) job[3], (String) job[4]);
             } catch (Exception e) {
-                Log.d(TAG, "fake в фоне не удался: " + e);
+                log(TAG,  "fake в фоне не удался: " + e);
             }
         }
     }
@@ -169,9 +167,9 @@ public final class Desync {
             }
             stats.log("fake-соединение [" + r.name + "] " + r.fakeName + " x" + r.repeat
                     + " ttl=" + r.ttl + " -> " + peer);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             // Не ошибка приложения: фейк мог и не дойти до сервера — в этом весь смысл.
-            Log.d(TAG, "fake-соединение не удалось: " + e);
+            log(TAG,  "fake-соединение не удалось: " + e);
         } finally {
             if (fd != null) {
                 try { Os.close(fd); } catch (Exception ignored) { }
@@ -199,12 +197,17 @@ public final class Desync {
             stats.desyncQuic.incrementAndGet();
             stats.log("udp-fake [" + r.name + "] x" + r.repeat + " ttl=" + r.ttl + " -> " + peer);
         } catch (Exception e) {
-            Log.d(TAG, "udp-fake пропущен: " + e);
+            log(TAG,  "udp-fake пропущен: " + e);
         } finally {
             if (fd != null) {
                 try { Os.close(fd); } catch (Exception ignored) { }
             }
         }
+    }
+
+    /** Журнал без android.util.Log: тот же код должен работать и на обычной JVM. */
+    static void log(String tag, String msg) {
+        System.err.println(tag + ": " + msg);
     }
 
     private static void setHop(FileDescriptor fd, boolean v6, int ttl) throws Exception {

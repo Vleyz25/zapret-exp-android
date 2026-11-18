@@ -95,7 +95,7 @@ public final class UdpFlow {
     /** Первая датаграмма потока: по правилу EXP сначала уходят фейки, потом оригинал. */
     public void sendToServer(byte[] data, int off, int len, boolean first) {
         try {
-            if (!ZapretService.IPV6_UP && realV6) {
+            if (!Net.IPV6_UP && realV6) {
                 // IPv6-канала у оператора нет — слать туда бессмысленно, и приложение
                 // само выберет IPv4, если мы уберём AAAA из DNS
                 host.stats().log("udp: нет IPv6 вверх, к " + peer + " не идём");
@@ -155,7 +155,7 @@ public final class UdpFlow {
                     if (kinds != null && dnsQueryName != null) {
                         host.stats().log("dns " + dnsQueryName + ": " + kinds);
                     }
-                    if (!ZapretService.IPV6_UP) {
+                    if (!Net.IPV6_UP) {
                         byte[] stripped = Hello.dnsStripAaaa(buf, 0, n);
                         if (stripped != null) {
                             out = stripped;
@@ -194,7 +194,7 @@ public final class UdpFlow {
         copy[1] = req[1];
         byte[] out = copy;
         int outLen = copy.length;
-        if (!ZapretService.IPV6_UP) {
+        if (!Net.IPV6_UP) {
             byte[] stripped = Hello.dnsStripAaaa(copy, 0, copy.length);
             if (stripped != null) { out = stripped; outLen = stripped.length; }
         }

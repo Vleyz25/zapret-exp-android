@@ -151,6 +151,50 @@ public final class Bits {
         return 0;
     }
 
+    /**
+     * Проверить контрольные суммы IPv4-пакета: заголовка и TCP/UDP с псевдонаголовкой.
+     * Возвращает текст ошибки или null, если всё верно.
+     */
+    public static String verify(byte[] b, int len) {
+        try {
+            if (len < 20) return "короткий пакет";
+            int ver = (b[0] & 0xFF) >> 4;
+            if (ver != 4) return "не IPv4 (проверка сумм только для v4)";
+            int ihl = (b[0] & 0x0F) * 4;
+            if (ihl < 20 || len < ihl + 8) return "некорректный IHL";
+
+            // IPv4: поле суммы обнуляем, пересчитываем и сравниваем с тем, что было
+            int storedH = u16(b, 10);
+            put16(b, 10, 0);
+            int calcH = checksum(b, 0, ihl, 0);
+            put16(b, 10, storedH);
+            if (storedH != calcH) {
+                return "IPv4 checksum: в пакете " + Integer.toHexString(storedH)
+                        + ", посчитано " + Integer.toHexString(calcH);
+            }
+
+            int proto = u8(b, 9);
+            int l4 = len - ihl;
+            byte[] src = slice(b, 12, 4);
+            byte[] dst = slice(b, 16, 4);
+            long seed = pseudoSeed(src, dst, proto, l4);
+            int csumOff = proto == IPPROTO_TCP ? ihl + 16 : proto == IPPROTO_UDP ? ihl + 6 : -1;
+            if (csumOff < 0) return null;                            // ICMP и прочие не проверяем
+            int stored4 = u16(b, csumOff);
+            put16(b, csumOff, 0);
+            int calc4 = checksum(b, ihl, l4, seed);
+            put16(b, csumOff, stored4);
+            if (stored4 != calc4) {
+                return (proto == IPPROTO_TCP ? "TCP" : "UDP") + " checksum: в пакете "
+                        + Integer.toHexString(stored4) + ", посчитано " + Integer.toHexString(calc4);
+            }
+            return null;
+        } catch (Exception e) {
+            return "исключение при проверке сумм: " + e;
+        }
+    }
+
+
     /** Контрольная сумма RFC 1071 поверх seed. */
     public static int checksum(byte[] buf, int off, int len, long seed) {
         long sum = seed;

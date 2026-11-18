@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.ScrollView;
 import android.widget.Switch;
@@ -23,6 +24,9 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private Switch power;
+    private Button testButton;
+    private volatile boolean testRunning;
+    private final Stats localStats = new Stats();
     private TextView statusText;
     private TextView statsText;
     private TextView profileText;
@@ -46,6 +50,13 @@ public class MainActivity extends Activity {
         setContentView(R.layout.main);
 
         power = findViewById(R.id.power_switch);
+        testButton = findViewById(R.id.test_button);
+        testButton.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override
+            public void onClick(android.view.View v) {
+                runSelfTest();
+            }
+        });
         statusText = findViewById(R.id.status_text);
         statsText = findViewById(R.id.stats_text);
         profileText = findViewById(R.id.profile_text);
@@ -155,11 +166,53 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }
     }
 
+    /** источник журнала: живой из сервиса или локальный (для самопроверки при выключенном) */
+    private Stats statsSource() {
+        return ZapretService.liveStats != null ? ZapretService.liveStats : localStats;
+    }
+
+    private void runSelfTest() {
+        if (testRunning) return;
+        testRunning = true;
+        testButton.setEnabled(false);
+        testButton.setText(R.string.test_running);
+        final Stats sink = ZapretService.liveStats != null ? ZapretService.liveStats : localStats;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                SelfTest.run(profile, new SelfTest.Sink() {
+                    @Override
+                    public void line(final String text) {
+                        sink.log(text);
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                refresh();
+                            }
+                        });
+                    }
+                });
+                sink.log("проверка закончена: сфотографируй блок «ИТОГ»");
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        testRunning = false;
+                        testButton.setEnabled(true);
+                        testButton.setText(R.string.test_button);
+                        refresh();
+                    }
+                });
+            }
+        }, "selftest");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private void refresh() {
         boolean on = ZapretService.running;
         if (!pendingStart) power.setChecked(on);
         statusText.setText(on ? R.string.switch_on : R.string.switch_off);
-        Stats s = ZapretService.liveStats;
+        Stats s = statsSource();
         if (!on) {
             StringBuilder err = new StringBuilder();
             if (ZapretService.lastError != null) {
@@ -168,8 +221,8 @@ public class MainActivity extends Activity {
             err.append("Выключено. Списков: ").append(profile.domainCount())
                     .append(" доменов, правил: ").append(profile.rules.size());
             statsText.setText(err.toString());
-            if (s != null) showLog(s);
-            // после отказа разблокируем тумблер, чтобы второй нажатие сработало
+            showLog(s);
+            // после отказа разблокируем тумблер, чтобы второе нажатие сработало
             if (!pendingStart) power.setChecked(false);
             return;
         }

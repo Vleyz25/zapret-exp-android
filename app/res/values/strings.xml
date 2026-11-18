@@ -12,6 +12,8 @@ DNS: ответов %6$d, из кэша %7$d
     <string name="profile_name">Профиль: general (EXP), перенос стратегии с ПК</string>
     <string name="notif_running">Запрет активен</string>
     <string name="notif_idle">Запрет выключен</string>
+    <string name="test_button">Проверить, работает ли в моей сети</string>
+    <string name="test_running">Проверяю: youtube, discord, github…</string>
     <string name="notif_stop">Выключить запрет</string>
     <string name="channel_name">Туннель</string>
 </resources>

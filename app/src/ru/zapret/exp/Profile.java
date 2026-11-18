@@ -42,43 +42,57 @@ public final class Profile {
         }
     };
 
+    /**
+     * Сборка профиля из уже прочитанных данных. Чистый код без Android-API — поэтому
+     * тесты на обычной JVM работают с ровно тем же конфигом, что лежит в APK.
+     */
+    public static Profile build(Map<String, Config.HostSet> lists, Map<String, byte[]> fakeMap,
+                                List<Config.Rule> parsedRules, String label) {
+        Profile p = new Profile();
+        for (Map.Entry<String, Config.HostSet> e : lists.entrySet()) {
+            hostListsPut(p, e.getKey(), e.getValue());
+        }
+        p.fakes.putAll(fakeMap);
+        p.excludes = p.hostLists.get("zapret-exclude");
+        for (Config.Rule r : parsedRules) {
+            if (r.fakeName != null && r.fake == null) r.fake = null;     // фейк-файл пропал
+            p.rules.add(r);
+        }
+        p.domainCount = 0;
+        for (Config.HostSet hs : p.hostLists.values()) p.domainCount += hs.size();
+        p.summary = (label == null ? "" : label + ", ") + "доменов: " + p.domainCount
+                + ", fake-паттернов: " + p.fakes.size() + ", правил: " + p.rules.size();
+        return p;
+    }
+
     public static Profile load(Context ctx) {
         Profile p = new Profile();
         try {
             copyToFilesDir(ctx);
 
+            Map<String, Config.HostSet> lists = new HashMap<>();
+            Map<String, byte[]> fakeMap = new HashMap<>();
             for (String name : ctx.getAssets().list("pc")) {
                 if (name.endsWith(".txt") && !name.startsWith("list-")) {
-                    hostListsPut(p, Config.stripExt(name),
+                    lists.put(Config.stripExt(name),
                             Config.parseHostList(readAssetLines(ctx, "pc/" + name)));
                 } else if (name.endsWith(".bin")) {
-                    p.fakes.put(Config.stripExt(name), readAssetBytes(ctx, "pc/" + name));
+                    fakeMap.put(Config.stripExt(name), readAssetBytes(ctx, "pc/" + name));
                 }
             }
             // discord.media — как --hostlist-domains=discord.media в bat.
-            // обычно берётся из pc/discordmedia.txt, на всякий случай проверяем,
-            // что список точно существует.
-            if (!p.hostLists.containsKey("discordmedia")) {
+            if (!lists.containsKey("discordmedia")) {
                 Config.HostSet dm = new Config.HostSet();
                 dm.add("discord.media");
-                hostListsPut(p, "discordmedia", dm);
+                lists.put("discordmedia", dm);
             }
-            p.excludes = p.hostLists.get("zapret-exclude");
 
+            List<Config.Rule> parsed = new ArrayList<>();
             for (String line : readAssetLines(ctx, "rules-exp.txt")) {
-                Config.Rule r = Config.parseRuleLine(line, p.fakes);
-                if (r == null) continue;
-                if (r.fakeName != null && r.fake == null) {
-                    Log.w(TAG, "правило " + r.name + ": нет файла fake=" + r.fakeName + ", фейк отключён");
-                    r.fake = null;
-                }
-                p.rules.add(r);
+                Config.Rule r = Config.parseRuleLine(line, fakeMap);
+                if (r != null) parsed.add(r);
             }
-            p.domainCount = 0;
-            for (Config.HostSet hs : p.hostLists.values()) p.domainCount += hs.size();
-
-            p.summary = "списков: " + p.hostLists.size() + ", доменов: " + p.domainCount
-                    + ", fake-паттернов: " + p.fakes.size() + ", правил: " + p.rules.size();
+            p = build(lists, fakeMap, parsed, null);
             Log.i(TAG, "профиль загружен: " + p.summary);
         } catch (Exception e) {
             Log.e(TAG, "не удалось загрузить профиль", e);
@@ -104,6 +118,21 @@ public final class Profile {
     public Config.Rule matchUdp(int dport, byte[] dstIp) {
         // SNI в QUIC зашифрован -> хост ищем по IP через карту наших DNS-ответов
         return Config.match(rules, hostLists, excludes, false, dport, hostForIp(dstIp));
+    }
+
+    /**
+     * Правило-образец для самопроверки: если для проверяемого хоста своего правила нет
+     * (например, github в списки zapret не входит), берём первое tcp-правило с
+     * фрагментацией — обычно general-main. Иначе проверка «с десинхом» ничего не проверяет.
+     */
+    public Config.Rule desyncSample() {
+        for (Config.Rule r : rules) {
+            if (r.name != null && r.name.equals("general-main") && r.tcp) return r;
+        }
+        for (Config.Rule r : rules) {
+            if (r.tcp && r.splitPos > 0) return r;
+        }
+        return null;
     }
 
     public void learnDnsAnswer(String qname, List<byte[]> addrs) {

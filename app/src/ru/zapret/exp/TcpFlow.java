@@ -1,6 +1,5 @@
 package ru.zapret.exp;
 
-import android.util.Log;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -33,7 +32,6 @@ import java.util.ArrayDeque;
  */
 public final class TcpFlow {
 
-    private static final String TAG = "TcpFlow";
     private static final int OUR_SCALE = 4;              // наше окно: 65535 << 4 ~= 1 МБ
     private static final int MAX_QUEUE = 1 << 20;        // вверх, 1 МБ
     private static final int MAX_OUT = 8 << 20;          // вниз, 8 МБ
@@ -132,8 +130,7 @@ public final class TcpFlow {
     private int mss() {
         int d = dlMss;
         if (d >= 88) return d;
-        int m = ZapretService.MTU - (v6 ? 60 : 40);
-        return m < 536 ? 536 : m;
+        return Net.mss(v6);
     }
 
     /** Какое окно объявляем клиенту (в сыром виде, он умножит на 1<<OUR_SCALE). */
@@ -167,7 +164,9 @@ public final class TcpFlow {
         peerAcked = Window.advanceAcked(peerAcked, p.ackNum);
         peerWindow = Math.min(16L << 20, (p.window & 0xFFFFL) << peerScale);
 
-        if (p.dataLen > 0) {
+        boolean hasData = p.dataLen > 0;
+        boolean accepted = false;
+        if (hasData) {
             long seq = p.seq & 0xFFFFFFFFL;
             long end = (seq + p.dataLen) & 0xFFFFFFFFL;
             int skip = 0, take = p.dataLen;
@@ -179,24 +178,32 @@ public final class TcpFlow {
             }
             if (take > 0) {
                 byte[] chunk = Bits.slice(p.buf, p.dataOff + skip, take);
-                boolean accepted;
+                boolean ok;
                 synchronized (lock) {
-                    accepted = queued + take <= MAX_QUEUE;
-                    if (accepted) {
+                    ok = queued + take <= MAX_QUEUE;
+                    if (ok) {
                         queue.add(chunk);
                         queued += take;
                         host.stats().bytesUp.addAndGet(take);
                     }
                     lock.notifyAll();
                 }
-                if (!accepted) host.stats().dropped.incrementAndGet();
+                if (!ok) host.stats().dropped.incrementAndGet();
+                accepted = ok;
                 rcvNxt = (seq + skip + take) & 0xFFFFFFFFL;
             }
         }
 
         if (isSet(p.flags, Bits.FIN)) clientDone = true;
 
-        host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.ACK, advWindow(), null, 0, 0, 0));
+        // Штатное правило TCP: подтверждаем только то, что пришло нового (данные, FIN,
+        // или дубликат, который надо пнуть). Чистый ACK клиента ответом не считается,
+        // иначе два конца разговора гоняют друг другу ACKы без перерыва: стенд на
+        // настоящем TLS насчитал их миллионы, и это сожжённый CPU и скорость.
+        boolean duplicate = hasData && !accepted;
+        if (hasData || duplicate || isSet(p.flags, Bits.FIN)) {
+            host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.ACK, advWindow(), null, 0, 0, 0));
+        }
 
         // возможно, клиент открыл окно — есть чем разблокировать отдачу
         synchronized (lock) { lock.notifyAll(); }
@@ -212,7 +219,7 @@ public final class TcpFlow {
 
     private void run() {
         try {
-            if (v6 && !ZapretService.IPV6_UP) {
+            if (v6 && !Net.IPV6_UP) {
                 // без IPv6-канала вверх соединение туда обречено: отвечаем RST сразу,
                 // а не держим клиента 8 секунд на таймауте
                 host.stats().log("нет IPv6 вверх: " + peer + " отклонено");
@@ -340,7 +347,6 @@ public final class TcpFlow {
                 } else {
                     host.stats().log("нет связи с " + peer + " (" + (v6 ? "IPv6" : "IPv4")
                             + "): " + reason(e));
-                    Log.d(TAG, "connect failed", e);
                     try {
                         host.toTun(Bits.buildTcp(tmpl, sndNxt, rcvNxt, Bits.RST, 0, null, 0, 0, 0));
                     } catch (Exception ignored) { }
